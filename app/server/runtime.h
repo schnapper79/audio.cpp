@@ -79,11 +79,19 @@ private:
         const LoadedModel & model,
         engine::runtime::TaskRequest request) const;
     struct TimedTaskResult;
+    struct TimedBatchResult;
     // `busy_timeout_ms` on each of these is the per-request override parsed from the
     // request body; nullopt means "use the model's configured ceiling".
     TimedTaskResult run_model(
         LoadedModel & model,
         const engine::runtime::TaskRequest & request,
+        std::optional<int> busy_timeout_ms = std::nullopt);
+    // Runs every request in one batched pass, holding the model lock once for
+    // the whole batch. Nothing is scheduled or queued here: what arrives in a
+    // single call is what gets batched.
+    TimedBatchResult run_model_batch(
+        LoadedModel & model,
+        const std::vector<engine::runtime::TaskRequest> & requests,
         std::optional<int> busy_timeout_ms = std::nullopt);
     TimedTaskResult run_streaming_model(
         LoadedModel & model,
@@ -106,6 +114,7 @@ private:
         const std::function<void(const engine::runtime::StreamEvent &)> & event_sink = {},
         std::optional<int> busy_timeout_ms = std::nullopt);
     HttpResponse handle_speech(const std::string & body_text);
+    HttpResponse handle_speech_batch(const std::string & body_text);
     HttpResponse handle_speech_stream(
         LoadedModel & model,
         const engine::runtime::TaskRequest & request,

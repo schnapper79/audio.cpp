@@ -508,12 +508,18 @@ std::vector<HiggsGenerationResult> HiggsGenerator::generate_batch(
     const auto codec_start = Clock::now();
     for (int64_t slot = 0; slot < slots; ++slot) {
         const auto index = static_cast<size_t>(slot);
-        if (!states[index].generation_done) {
-            throw std::runtime_error(
-                "Higgs TTS batch generation reached max_tokens before EOC in slot " +
-                std::to_string(slot));
-        }
         auto & result = results[index];
+        if (!states[index].generation_done) {
+            // Recoverable and per request: the caller can split this text and
+            // retry it alone. Failing the batch would throw away the other
+            // slots' finished audio for no reason. The wording keeps "max_tokens"
+            // because clients match on it to trigger exactly that retry.
+            result.error =
+                "Higgs TTS generation reached max_tokens before EOC";
+            result.delayed_codes.clear();
+            result.delayed_frames = 0;
+            continue;
+        }
         // Fixed-size head so the values line up with the single path's
         // delayed_codes_head8 trace and can be diffed directly.
         const int64_t delayed_head_rows = std::min<int64_t>(result.delayed_frames, 8);

@@ -84,9 +84,18 @@ AppBatchResult run_offline_batch(
         // actually is; session_wall_ms still carries the true total.
         const double amortized_ms = batch_wall_ms / static_cast<double>(results.size());
         for (size_t index = 0; index < results.size(); ++index) {
+            // The CLI aborts a batch run on the first failure, exactly as the
+            // sequential path below does when run() throws. Per-request recovery
+            // is for callers that can retry one request on its own; a CLI run has
+            // no such loop, and silently writing fewer files than were asked for
+            // would be worse than stopping.
+            if (!results[index].ok()) {
+                throw std::runtime_error(
+                    "request '" + batch.requests[index].id + "' failed: " + results[index].error);
+            }
             out.results.push_back(AppRequestResult{
                 batch.requests[index].id,
-                std::move(results[index]),
+                std::move(results[index].result),
                 amortized_ms,
             });
             if (on_result) {

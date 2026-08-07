@@ -671,6 +671,12 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     else if (request.method == "POST" && request.path == "/v1/audio/speech") {
         response = handle_speech(request.body);
     }
+    // Separate path rather than an array-shaped "input" on the endpoint above:
+    // the response has to carry several audios and a per-item status, so it
+    // cannot keep returning audio/wav, and every existing client stays untouched.
+    else if (request.method == "POST" && request.path == "/v1/audio/speech/batch") {
+        response = handle_speech_batch(request.body);
+    }
     else if (request.method == "POST" && request.path == "/v1/audio/transcriptions") {
         response = handle_transcription(request);
     }
@@ -935,6 +941,13 @@ struct ServerState::TimedTaskResult {
     std::optional<double> ttft_ms;
 };
 
+struct ServerState::TimedBatchResult {
+    std::vector<engine::runtime::BatchedTaskResult> results;
+    // Wall time of the batch as a whole. There is no meaningful per-request
+    // time: the requests are decoded together, step for step.
+    double wall_ms = 0.0;
+};
+
 int ServerState::model_busy_timeout_ceiling(const LoadedModel & model) const {
     return model.config.busy_timeout_ms.value_or(config_.busy_timeout_ms);
 }
@@ -960,6 +973,47 @@ ServerState::TimedTaskResult ServerState::run_model(
     model.session->prepare(engine::runtime::build_preparation_request(request));
     auto result = model.offline->run(request);
     return TimedTaskResult{std::move(result), elapsed_ms(started), std::nullopt};
+}
+
+ServerState::TimedBatchResult ServerState::run_model_batch(
+    LoadedModel & model,
+    const std::vector<engine::runtime::TaskRequest> & requests,
+    std::optional<int> busy_timeout_ms) {
+    if (requests.empty()) {
+        throw std::runtime_error("batched run requires at least one request");
+    }
+    // One lock for the whole batch. Requests inside it are decoded together, so
+    // there is nothing to interleave and BusyGuard keeps doing exactly what it
+    // did before: one thing at a time per model.
+    BusyGuard::Lock lock = acquire_model_run(model, busy_timeout_ms);
+    ensure_model_loaded_locked(model);
+    if (model.offline == nullptr) {
+        throw std::runtime_error("configured model does not provide offline execution: " + model.config.id);
+    }
+    auto * batched = dynamic_cast<engine::runtime::IBatchedOfflineVoiceTaskSession *>(model.offline);
+    const auto started = Clock::now();
+    model.session->prepare(engine::runtime::build_preparation_request(requests.front()));
+
+    TimedBatchResult out;
+    if (batched != nullptr) {
+        out.results = batched->run_batch(requests);
+    } else {
+        // The family has no batched path. Answering the same shape one request
+        // at a time keeps the endpoint usable everywhere; only the speedup is
+        // missing, and clients do not have to branch on model family.
+        out.results.reserve(requests.size());
+        for (const auto & request : requests) {
+            engine::runtime::BatchedTaskResult entry;
+            try {
+                entry.result = model.offline->run(request);
+            } catch (const std::exception & ex) {
+                entry.error = ex.what();
+            }
+            out.results.push_back(std::move(entry));
+        }
+    }
+    out.wall_ms = elapsed_ms(started);
+    return out;
 }
 
 // `audio` selects where the samples come from: null means request.audio_input, as
@@ -1041,6 +1095,77 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
     response.body = std::string(reinterpret_cast<const char *>(wav.data()), wav.size());
     response.headers = timing_headers(timed_result.wall_ms, audio);
     return response;
+}
+
+HttpResponse ServerState::handle_speech_batch(const std::string & body_text) {
+    const auto body = engine::io::json::parse(body_text);
+    auto & model = require_model(body);
+
+    const auto * items = body.find("items");
+    if (items == nullptr || !items->is_array()) {
+        throw std::runtime_error("speech batch requires an items array");
+    }
+    if (items->as_array().empty()) {
+        throw std::runtime_error("speech batch requires at least one item");
+    }
+
+    // Every top-level field except "items" acts as a default for each item, and
+    // an item may override any of them -- most importantly the voice, since a
+    // batch usually mixes speakers. Merging into a plain object and reusing
+    // build_speech_request means an item behaves exactly like the same body sent
+    // to /v1/audio/speech, including voice presets and option handling, without
+    // this endpoint growing its own copy of those rules.
+    engine::io::json::Value::Object defaults = body.as_object();
+    defaults.erase("items");
+    defaults.erase("model");
+    defaults.erase("busy_timeout_ms");
+
+    std::vector<engine::runtime::TaskRequest> requests;
+    requests.reserve(items->as_array().size());
+    for (const auto & item : items->as_array()) {
+        if (!item.is_object()) {
+            throw std::runtime_error("speech batch items must be objects");
+        }
+        auto merged = defaults;
+        for (const auto & [key, value] : item.as_object()) {
+            merged[key] = value;
+        }
+        requests.push_back(build_speech_request(model, engine::io::json::Value::make_object(std::move(merged))));
+    }
+
+    const auto busy_timeout_ms = parse_busy_timeout_override(body);
+    const auto timed = run_model_batch(model, requests, busy_timeout_ms);
+    if (timed.results.size() != requests.size()) {
+        throw std::runtime_error("batched run returned the wrong result count");
+    }
+
+    // Always JSON: the response carries several audios plus a per-item status,
+    // which a bare audio/wav body cannot express.
+    std::string out = "{\"data\":[";
+    size_t failed = 0;
+    for (size_t index = 0; index < timed.results.size(); ++index) {
+        const auto & entry = timed.results[index];
+        if (index != 0) {
+            out += ",";
+        }
+        out += "{\"index\":" + std::to_string(index);
+        if (!entry.ok()) {
+            // Reported per item, not as an HTTP error: the other items in this
+            // batch succeeded, and the caller normally retries just this one.
+            ++failed;
+            out += ",\"error\":{\"message\":" + json_quote(entry.error) + "}}";
+            continue;
+        }
+        const auto & audio = select_audio_output(entry.result);
+        const auto wav = encode_pcm16_wav(audio);
+        out += ",\"audio\":" + json_quote(base64_encode(wav)) +
+            ",\"format\":\"wav\",\"sample_rate\":" + std::to_string(audio.sample_rate) +
+            ",\"channels\":" + std::to_string(audio.channels) + "}";
+    }
+    out += "],\"count\":" + std::to_string(timed.results.size()) +
+        ",\"failed\":" + std::to_string(failed) +
+        ",\"timing\":" + timing_json(timed.wall_ms) + "}";
+    return json_response(out);
 }
 
 HttpResponse ServerState::handle_speech_stream(

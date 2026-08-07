@@ -37,6 +37,12 @@ struct HiggsGenerationResult {
     int64_t delayed_frames = 0;
     std::vector<int32_t> raw_codes;
     int64_t raw_frames = 0;
+    // Only ever set by generate_batch(). A request that runs into the token
+    // limit fails on its own instead of aborting the whole batch, so that
+    // callers can retry just that one -- typically by splitting the text.
+    // `audio` is then empty. generate() keeps throwing for the same condition,
+    // because there is no batch left to protect.
+    std::string error;
 };
 
 class HiggsGenerator {

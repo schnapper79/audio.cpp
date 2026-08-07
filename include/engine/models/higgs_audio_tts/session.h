@@ -30,7 +30,7 @@ public:
     void prepare(const runtime::SessionPreparationRequest & request) override;
     runtime::TaskResult run(const runtime::TaskRequest & request) override;
     int64_t max_batch_size() const override;
-    std::vector<runtime::TaskResult> run_batch(
+    std::vector<runtime::BatchedTaskResult> run_batch(
         const std::vector<runtime::TaskRequest> & requests) override;
 
 private:

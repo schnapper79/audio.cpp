@@ -290,17 +290,26 @@ int64_t HiggsTTSSession::max_batch_size() const {
     return max_batch_size_;
 }
 
-std::vector<runtime::TaskResult> HiggsTTSSession::run_batch(
+std::vector<runtime::BatchedTaskResult> HiggsTTSSession::run_batch(
     const std::vector<runtime::TaskRequest> & requests) {
     require_prepared("Higgs TTS run_batch");
     if (requests.empty()) {
         throw std::runtime_error("Higgs TTS run_batch requires at least one request");
     }
     if (max_batch_size_ <= 1 || requests.size() == 1) {
-        std::vector<runtime::TaskResult> out;
+        // Batching disabled or nothing to amortize. Run each request on its own
+        // and translate a throw into the same per-request error the batched path
+        // reports, so callers only have to handle one shape of failure.
+        std::vector<runtime::BatchedTaskResult> out;
         out.reserve(requests.size());
         for (const auto & request : requests) {
-            out.push_back(run(request));
+            runtime::BatchedTaskResult entry;
+            try {
+                entry.result = run(request);
+            } catch (const std::exception & ex) {
+                entry.error = ex.what();
+            }
+            out.push_back(std::move(entry));
         }
         return out;
     }
@@ -376,6 +385,10 @@ std::vector<runtime::TaskResult> HiggsTTSSession::run_batch(
     for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
         chunk_audio[request_index].resize(chunk_counts[request_index]);
     }
+    // A request's audio is the concatenation of its chunks, so one failed chunk
+    // fails that request -- but only that one. Its neighbours in the batch, and
+    // every other request, still return their audio.
+    std::vector<std::string> request_errors(requests.size());
 
     // Split into equally sized batches rather than filling each to the limit.
     // A trailing remainder batch is the expensive case: cost per step grows far
@@ -400,6 +413,14 @@ std::vector<runtime::TaskResult> HiggsTTSSession::run_batch(
         for (size_t index = start; index < end; ++index) {
             auto & result = batch_results[index - start];
             const auto & item = items[order[index]];
+            if (!result.error.empty()) {
+                auto & slot = request_errors[item.request_index];
+                if (slot.empty()) {
+                    slot = "chunk " + std::to_string(item.chunk_index + 1) + " of " +
+                        std::to_string(chunk_counts[item.request_index]) + ": " + result.error;
+                }
+                continue;
+            }
             chunk_audio[item.request_index][item.chunk_index] = runtime::AudioBuffer{
                 result.audio.sample_rate,
                 result.audio.channels,
@@ -408,16 +429,21 @@ std::vector<runtime::TaskResult> HiggsTTSSession::run_batch(
         }
     }
 
-    std::vector<runtime::TaskResult> out;
+    std::vector<runtime::BatchedTaskResult> out;
     out.reserve(requests.size());
     for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
+        runtime::BatchedTaskResult entry;
+        if (!request_errors[request_index].empty()) {
+            entry.error = std::move(request_errors[request_index]);
+            out.push_back(std::move(entry));
+            continue;
+        }
         runtime::AudioBuffer merged;
         for (auto & chunk : chunk_audio[request_index]) {
             runtime::append_audio_buffer(merged, std::move(chunk));
         }
-        runtime::TaskResult result;
-        result.audio_output = std::move(merged);
-        out.push_back(std::move(result));
+        entry.result.audio_output = std::move(merged);
+        out.push_back(std::move(entry));
     }
     debug::timing_log_scalar("session.batch_wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
     return out;

@@ -234,6 +234,22 @@ public:
     virtual TaskResult run(const TaskRequest & request) = 0;
 };
 
+// One request's outcome inside a batch.
+//
+// A request that fails must not take its neighbours down with it. Callers
+// commonly retry a single failed request on its own -- splitting a text that
+// hit the token limit, for example -- and that is only possible if the results
+// that did succeed survive. So recoverable per-request failures are reported
+// here rather than thrown. Errors that indicate a broken call (malformed
+// request, shape mismatch) are still thrown, because no retry would help.
+struct BatchedTaskResult {
+    TaskResult result;
+    // Empty on success. Carries the reason otherwise, and `result` is then unset.
+    std::string error;
+
+    bool ok() const noexcept { return error.empty(); }
+};
+
 // Offline session that can run several requests through one batched forward
 // pass. Implemented by families whose decode is memory bandwidth bound, where
 // batching amortizes the per-token weight read across sequences. Callers should
@@ -246,8 +262,8 @@ public:
     // in which case callers should stay on run().
     virtual int64_t max_batch_size() const = 0;
 
-    // Results are returned in the order of `requests`.
-    virtual std::vector<TaskResult> run_batch(const std::vector<TaskRequest> & requests) = 0;
+    // Results are returned in the order of `requests`, one entry per request.
+    virtual std::vector<BatchedTaskResult> run_batch(const std::vector<TaskRequest> & requests) = 0;
 };
 
 class IStreamingVoiceTaskSession : public virtual IVoiceTaskSession {
