@@ -21,6 +21,15 @@ constexpr int64_t kDefaultTextChunkSize = 1024;
 constexpr int64_t kDefaultReferenceCacheSlots = 1;
 constexpr int64_t kDefaultMaxBatchSize = 1;
 
+// ggml's CUDA vector-matmul kernels cover a batch of at most 8 -- see
+// MMVQ_MAX_BATCH_SIZE in ggml-cuda/mmvq.cuh and MMVF_MAX_BATCH_SIZE in
+// mmvf.cuh, which apply to quantized and float weights respectively. Past that
+// the backend switches to the tiled path built for prefill-sized batches, which
+// for one token per sequence means re-materializing the weights every step.
+// Measured on an RTX 4000 Ada with the Q8 package: 2.6 ms per sequence-token at
+// batch 8, 11.2 ms at batch 9. Going above 8 is never faster, so clamp.
+constexpr int64_t kMaxCudaBatchSize = 8;
+
 void validate_matmul_weight_storage(assets::TensorStorageType storage_type, const char * option_name) {
     if (storage_type == assets::TensorStorageType::Native ||
         storage_type == assets::TensorStorageType::F32 ||
@@ -207,6 +216,17 @@ HiggsTTSSession::HiggsTTSSession(
         ar_,
         codec_,
         ar_decode_graph_arena_bytes_);
+
+    if (ar_->backend_type() == core::BackendType::Cuda && max_batch_size_ > kMaxCudaBatchSize) {
+        debug::log_message(
+            debug::LogLevel::Warning,
+            "higgs_audio_tts",
+            "higgs_audio_tts.max_batch=" + std::to_string(max_batch_size_) +
+                " exceeds the CUDA vector-matmul batch limit of " +
+                std::to_string(kMaxCudaBatchSize) +
+                "; clamping, because larger batches fall back to a much slower kernel path");
+        max_batch_size_ = kMaxCudaBatchSize;
+    }
 }
 
 std::string HiggsTTSSession::family() const {
@@ -357,9 +377,17 @@ std::vector<runtime::TaskResult> HiggsTTSSession::run_batch(
         chunk_audio[request_index].resize(chunk_counts[request_index]);
     }
 
+    // Split into equally sized batches rather than filling each to the limit.
+    // A trailing remainder batch is the expensive case: cost per step grows far
+    // more slowly than the batch, so 5+5 beats 8+2 for ten requests.
     const size_t batch_limit = static_cast<size_t>(max_batch_size_);
-    for (size_t start = 0; start < order.size(); start += batch_limit) {
-        const size_t end = std::min(start + batch_limit, order.size());
+    const size_t batch_count = (order.size() + batch_limit - 1) / batch_limit;
+    const size_t base_size = order.size() / batch_count;
+    const size_t remainder = order.size() % batch_count;
+    for (size_t index = 0, batch_index = 0; index < order.size(); ++batch_index) {
+        const size_t start = index;
+        const size_t end = start + base_size + (batch_index < remainder ? 1 : 0);
+        index = end;
         std::vector<HiggsGenerationRequest> batch;
         batch.reserve(end - start);
         for (size_t index = start; index < end; ++index) {

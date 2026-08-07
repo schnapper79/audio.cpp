@@ -450,15 +450,22 @@ audiocpp_cli --task tts --family higgs_audio_tts --model models/Higgs-Audio-v3-T
 
 | Session option | Values | Default | Meaning |
 |---|---|---:|---|
-| `higgs_audio_tts.max_batch` | integer | `1` | Requests decoded together. `1` keeps the single-sequence path. |
+| `higgs_audio_tts.max_batch` | 1 to 8 | `1` | Requests decoded together. `1` keeps the single-sequence path. Values above 8 are clamped on CUDA, see below. |
 | `higgs_audio_tts.reference_cache_slots` | integer | `1` | Encoded reference-audio cache slots. Set to the number of distinct voices in the batch, otherwise every request re-encodes its reference. |
 
-Measured on an RTX 4000 Ada (20 GB, ~360 GB/s) with the Q8 package, five requests sharing one voice:
+**Do not go above 8 on CUDA.** ggml's vector-matmul kernels cover a batch of at most 8 (`MMVQ_MAX_BATCH_SIZE`, `MMVF_MAX_BATCH_SIZE`); past that the backend switches to the tiled path meant for prefill-sized batches, which with one token per sequence is dramatically slower — slower even than not batching. The session clamps to 8 on CUDA and logs a warning.
 
-| | Per generated token | Batch wall time | Throughput |
-|---|---:|---:|---:|
-| Sequential (`max_batch=1`) | 14.0 ms | 11.1 s | 2.6x realtime |
-| Batched (`max_batch=5`) | 3.3 ms | 4.5 s | 6.4x realtime |
+Measured on an RTX 4000 Ada (20 GB, ~360 GB/s) with the Q8 package, ten requests sharing one voice:
+
+| `max_batch` | Per sequence-token | Total wall time | Throughput |
+|---:|---:|---:|---:|
+| 1 (sequential) | 14.0 ms | 22.4 s | 2.5x realtime |
+| 2 | 7.1 ms | 12.7 s | 4.5x realtime |
+| 5 | 3.3 ms | 7.4 s | 7.7x realtime |
+| 8 | 2.6 ms | 7.4 s | 7.7x realtime |
+| 9 | 11.2 ms | — | falls off the kernel cliff |
+
+Requests are split into equally sized batches rather than filling each to the limit, because cost per step grows much more slowly than the batch: for ten requests at `max_batch=8`, two batches of five beat one of eight plus one of two.
 
 Notes:
 
