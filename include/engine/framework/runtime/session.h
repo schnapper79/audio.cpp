@@ -234,6 +234,22 @@ public:
     virtual TaskResult run(const TaskRequest & request) = 0;
 };
 
+// Offline session that can run several requests through one batched forward
+// pass. Implemented by families whose decode is memory bandwidth bound, where
+// batching amortizes the per-token weight read across sequences. Callers should
+// treat this as an optional capability and fall back to run() per request.
+class IBatchedOfflineVoiceTaskSession : public virtual IOfflineVoiceTaskSession {
+public:
+    ~IBatchedOfflineVoiceTaskSession() override = default;
+
+    // Maximum requests per batched forward pass. 1 means batching is disabled,
+    // in which case callers should stay on run().
+    virtual int64_t max_batch_size() const = 0;
+
+    // Results are returned in the order of `requests`.
+    virtual std::vector<TaskResult> run_batch(const std::vector<TaskRequest> & requests) = 0;
+};
+
 class IStreamingVoiceTaskSession : public virtual IVoiceTaskSession {
 public:
     ~IStreamingVoiceTaskSession() override = default;

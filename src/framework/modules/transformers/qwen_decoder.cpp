@@ -775,10 +775,13 @@ QwenDecoderLayerOutputs QwenDecoderLayerModule::build_with_static_cache_tail(
         context = activation_cast(ctx, context, config_.activation_cast);
     }
     context = core::ensure_backend_addressable_layout(ctx, context);
+    // Carry the batch through instead of assuming a single sequence; identical
+    // to {1, 1, ...} for the single-sequence callers.
     context = core::reshape_tensor(
         ctx,
         context,
-        core::TensorShape::from_dims({1, 1, config_.num_attention_heads * dim}));
+        core::TensorShape::from_dims(
+            {input.shape.dims[0], input.shape.dims[1], config_.num_attention_heads * dim}));
 
     auto attn_out = LinearModule(
                         {

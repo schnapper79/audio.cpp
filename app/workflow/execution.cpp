@@ -65,6 +65,41 @@ AppBatchResult run_offline_batch(
     AppBatchResult out;
     out.prepare_ms = to_ms(Clock::now() - prepare_start);
     out.results.reserve(batch.requests.size());
+
+    auto * batched = dynamic_cast<engine::runtime::IBatchedOfflineVoiceTaskSession *>(&offline);
+    if (batched != nullptr && batched->max_batch_size() > 1 && batch.requests.size() > 1) {
+        std::vector<engine::runtime::TaskRequest> task_requests;
+        task_requests.reserve(batch.requests.size());
+        for (const auto & item : batch.requests) {
+            task_requests.push_back(item.request);
+        }
+        const auto run_start = Clock::now();
+        auto results = batched->run_batch(task_requests);
+        const double batch_wall_ms = to_ms(Clock::now() - run_start);
+        if (results.size() != batch.requests.size()) {
+            throw std::runtime_error("batched offline session returned the wrong result count");
+        }
+        // Batched requests run concurrently, so there is no per-request wall
+        // time to report. The amortized share is what the throughput of the run
+        // actually is; session_wall_ms still carries the true total.
+        const double amortized_ms = batch_wall_ms / static_cast<double>(results.size());
+        for (size_t index = 0; index < results.size(); ++index) {
+            out.results.push_back(AppRequestResult{
+                batch.requests[index].id,
+                std::move(results[index]),
+                amortized_ms,
+            });
+            if (on_result) {
+                on_result(index, out.results.back());
+            }
+        }
+        out.session_wall_ms = to_ms(Clock::now() - session_start);
+        if (audio_merge_mode == AudioMergeMode::Concat) {
+            out.merged_audio = concat_audio_outputs(out.results, out.chapters);
+        }
+        return out;
+    }
+
     for (const auto & item : batch.requests) {
         const auto run_start = Clock::now();
         auto result = offline.run(item.request);

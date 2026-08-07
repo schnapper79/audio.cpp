@@ -19,6 +19,7 @@ using Clock = std::chrono::steady_clock;
 
 constexpr int64_t kDefaultTextChunkSize = 1024;
 constexpr int64_t kDefaultReferenceCacheSlots = 1;
+constexpr int64_t kDefaultMaxBatchSize = 1;
 
 void validate_matmul_weight_storage(assets::TensorStorageType storage_type, const char * option_name) {
     if (storage_type == assets::TensorStorageType::Native ||
@@ -62,6 +63,17 @@ std::size_t resolve_reference_cache_slots(const runtime::SessionOptions & option
         throw std::runtime_error("higgs_audio_tts.reference_cache_slots is too large");
     }
     return static_cast<std::size_t>(slots);
+}
+
+int64_t resolve_max_batch_size(const runtime::SessionOptions & options) {
+    const int64_t size = runtime::parse_i64_option(
+        options.options,
+        {"higgs_audio_tts.max_batch", "max_batch"})
+        .value_or(kDefaultMaxBatchSize);
+    if (size < 1) {
+        throw std::runtime_error("higgs_audio_tts.max_batch must be at least 1");
+    }
+    return size;
 }
 
 const runtime::AudioBuffer * find_reference_audio(const runtime::TaskRequest & request) {
@@ -126,7 +138,8 @@ HiggsTTSSession::HiggsTTSSession(
     : RuntimeSessionBase(options),
       task_(task),
       assets_(std::move(assets)),
-      reference_cache_(resolve_reference_cache_slots(this->options())) {
+      reference_cache_(resolve_reference_cache_slots(this->options())),
+      max_batch_size_(resolve_max_batch_size(this->options())) {
     if (assets_ == nullptr) {
         throw std::runtime_error("Higgs TTS session requires assets");
     }
@@ -169,6 +182,7 @@ HiggsTTSSession::HiggsTTSSession(
             key != "higgs_audio_tts.codec_decode_graph_arena_mb" &&
             key != "higgs_audio_tts.codec_encode_graph_arena_mb" &&
             key != "higgs_audio_tts.reference_cache_slots" &&
+            key != "higgs_audio_tts.max_batch" &&
             key != "higgs_audio_tts.weight_type" &&
             key != "higgs_audio_tts.ar_weight_type" &&
             key != "higgs_audio_tts.codec_weight_type") {
@@ -249,6 +263,135 @@ runtime::TaskResult HiggsTTSSession::run(const runtime::TaskRequest & request) {
     runtime::TaskResult out;
     out.audio_output = std::move(merged_audio);
     debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
+    return out;
+}
+
+int64_t HiggsTTSSession::max_batch_size() const {
+    return max_batch_size_;
+}
+
+std::vector<runtime::TaskResult> HiggsTTSSession::run_batch(
+    const std::vector<runtime::TaskRequest> & requests) {
+    require_prepared("Higgs TTS run_batch");
+    if (requests.empty()) {
+        throw std::runtime_error("Higgs TTS run_batch requires at least one request");
+    }
+    if (max_batch_size_ <= 1 || requests.size() == 1) {
+        std::vector<runtime::TaskResult> out;
+        out.reserve(requests.size());
+        for (const auto & request : requests) {
+            out.push_back(run(request));
+        }
+        return out;
+    }
+
+    const auto wall_start = Clock::now();
+
+    // Long text is chunked before generation, so the unit of batching is a
+    // chunk, not a request. Chunks of one request are independent generations
+    // and only have to be concatenated in order afterwards.
+    struct ChunkItem {
+        size_t request_index = 0;
+        size_t chunk_index = 0;
+        uint64_t voice_key = 0;
+        size_t text_length = 0;
+        HiggsGenerationRequest generation;
+    };
+    std::vector<ChunkItem> items;
+    std::vector<size_t> chunk_counts(requests.size(), 0);
+    for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
+        const auto & request = requests[request_index];
+        const int64_t text_chunk_size =
+            engine::text::parse_text_chunk_size_override(request.options).value_or(kDefaultTextChunkSize);
+        const auto text_chunk_mode =
+            engine::text::parse_text_chunk_mode_override(request.options)
+                .value_or(engine::text::TextChunkMode::Default);
+        const auto chunk_requests = runtime::chunk_text_request(request, text_chunk_size, text_chunk_mode);
+        const std::string reference_text =
+            runtime::find_option(request.options, {"reference_text"}).value_or("");
+        const auto * reference_audio = find_reference_audio(request);
+        // Resolved here and consumed immediately: the returned reference points
+        // into a slot cache that a later resolve may evict.
+        const HiggsCodecEncodeOutput * reference_codes =
+            reference_audio != nullptr ? &resolve_reference_codes(*reference_audio, reference_text) : nullptr;
+        uint64_t voice_key = 1469598103934665603ull;
+        voice_key = fnv1a_mix(voice_key, reference_text.data(), reference_text.size());
+        if (reference_codes != nullptr && !reference_codes->codes.empty()) {
+            voice_key = fnv1a_mix(
+                voice_key,
+                reference_codes->codes.data(),
+                reference_codes->codes.size() * sizeof(int32_t));
+        }
+        chunk_counts[request_index] = chunk_requests.size();
+        for (size_t chunk_index = 0; chunk_index < chunk_requests.size(); ++chunk_index) {
+            ChunkItem item;
+            item.request_index = request_index;
+            item.chunk_index = chunk_index;
+            item.voice_key = voice_key;
+            item.generation = make_generation_request(chunk_requests[chunk_index], reference_codes);
+            item.text_length = item.generation.text.size();
+            items.push_back(std::move(item));
+        }
+    }
+
+    // Group by voice so every slot in a batch shares a reference prompt, then
+    // by length: slots run in lockstep until the longest one finishes, so
+    // batching similar lengths together is what keeps the padding cheap.
+    std::vector<size_t> order(items.size());
+    for (size_t index = 0; index < order.size(); ++index) {
+        order[index] = index;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+        if (items[lhs].voice_key != items[rhs].voice_key) {
+            return items[lhs].voice_key < items[rhs].voice_key;
+        }
+        return items[lhs].text_length < items[rhs].text_length;
+    });
+
+    debug::trace_log_scalar("higgs_audio_tts.run_batch.requests", static_cast<int64_t>(requests.size()));
+    debug::trace_log_scalar("higgs_audio_tts.run_batch.chunks", static_cast<int64_t>(items.size()));
+    debug::trace_log_scalar("higgs_audio_tts.run_batch.max_batch", max_batch_size_);
+
+    std::vector<std::vector<runtime::AudioBuffer>> chunk_audio(requests.size());
+    for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
+        chunk_audio[request_index].resize(chunk_counts[request_index]);
+    }
+
+    const size_t batch_limit = static_cast<size_t>(max_batch_size_);
+    for (size_t start = 0; start < order.size(); start += batch_limit) {
+        const size_t end = std::min(start + batch_limit, order.size());
+        std::vector<HiggsGenerationRequest> batch;
+        batch.reserve(end - start);
+        for (size_t index = start; index < end; ++index) {
+            batch.push_back(items[order[index]].generation);
+        }
+        auto batch_results = generator_->generate_batch(batch);
+        if (batch_results.size() != batch.size()) {
+            throw std::runtime_error("Higgs TTS batch generation returned the wrong result count");
+        }
+        for (size_t index = start; index < end; ++index) {
+            auto & result = batch_results[index - start];
+            const auto & item = items[order[index]];
+            chunk_audio[item.request_index][item.chunk_index] = runtime::AudioBuffer{
+                result.audio.sample_rate,
+                result.audio.channels,
+                std::move(result.audio.values),
+            };
+        }
+    }
+
+    std::vector<runtime::TaskResult> out;
+    out.reserve(requests.size());
+    for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
+        runtime::AudioBuffer merged;
+        for (auto & chunk : chunk_audio[request_index]) {
+            runtime::append_audio_buffer(merged, std::move(chunk));
+        }
+        runtime::TaskResult result;
+        result.audio_output = std::move(merged);
+        out.push_back(std::move(result));
+    }
+    debug::timing_log_scalar("session.batch_wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
     return out;
 }
 

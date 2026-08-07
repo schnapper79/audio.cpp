@@ -49,6 +49,16 @@ public:
     void prepare(const HiggsGenerationRequest & request);
     HiggsGenerationResult generate(const HiggsGenerationRequest & request);
 
+    // Decodes several requests through one batched AR graph. Decode is memory
+    // bandwidth bound at batch 1 -- the weights are re-read for every single
+    // token -- so running N sequences per step is what actually raises
+    // throughput. Per-request latency is unchanged.
+    //
+    // Requests should be grouped by reference voice by the caller: prompts then
+    // have similar lengths, which keeps the left padding small.
+    std::vector<HiggsGenerationResult> generate_batch(
+        const std::vector<HiggsGenerationRequest> & requests);
+
 private:
     struct ReferencePrefixCache {
         std::string reference_text;

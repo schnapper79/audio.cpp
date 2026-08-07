@@ -39,7 +39,9 @@ struct GgmlContextDeleter {
     }
 };
 
-modules::QwenDecoderStackConfig make_higgs_qwen_stack_config(const HiggsTextConfig & config) {
+modules::QwenDecoderStackConfig make_higgs_qwen_stack_config(
+    const HiggsTextConfig & config,
+    ggml_prec projection_precision = GGML_PREC_DEFAULT) {
     modules::QwenDecoderStackConfig out;
     out.hidden_size = config.hidden_size;
     out.num_attention_heads = config.num_attention_heads;
@@ -50,7 +52,11 @@ modules::QwenDecoderStackConfig make_higgs_qwen_stack_config(const HiggsTextConf
     out.rms_norm_eps = config.rms_norm_eps;
     out.rope_theta = config.rope_theta;
     out.attention_precision = GGML_PREC_F32;
-    out.projection_precision = GGML_PREC_DEFAULT;
+    // At batch 1 CUDA takes the mul_mat_vec path, which accumulates in fp32.
+    // From about four sequences it switches to tensor cores, and with
+    // GGML_PREC_DEFAULT those accumulate in fp16 -- visible as logits quantized
+    // to 1/16 steps. The batched graph therefore asks for fp32 explicitly.
+    out.projection_precision = projection_precision;
     out.qkv_layout = modules::QwenDecoderQKVLayout::Separate;
     out.use_qk_norm = true;
     out.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
@@ -64,8 +70,11 @@ modules::QwenDecoderStackConfig make_higgs_qwen_stack_config(const HiggsTextConf
 
 class HiggsQwenDecoderComponent {
 public:
-    HiggsQwenDecoderComponent(const HiggsTextConfig & config, bool packed_qkv)
-        : stack_config_(make_higgs_qwen_stack_config(config)),
+    HiggsQwenDecoderComponent(
+        const HiggsTextConfig & config,
+        bool packed_qkv,
+        ggml_prec projection_precision = GGML_PREC_DEFAULT)
+        : stack_config_(make_higgs_qwen_stack_config(config, projection_precision)),
           layer_config_(modules::qwen_decoder_layer_config_from_stack(stack_config_)),
           layer_module_([&] {
               layer_config_.qkv_layout = packed_qkv
@@ -135,6 +144,39 @@ core::TensorValue higgs_cache_view(
             cache.tensor->nb[2],
             cache.tensor->nb[3],
             static_cast<size_t>(start) * cache.tensor->nb[2]),
+        core::TensorShape::from_dims({1, steps, heads, head_dim}),
+        cache.type);
+}
+
+// View of one slot's step range in a batched cache laid out as
+// {slots, cache_steps, heads, head_dim} (ggml ne = [head_dim, heads, cache_steps, slots]).
+core::TensorValue higgs_batch_cache_view(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & cache,
+    int64_t slot,
+    int64_t start,
+    int64_t steps,
+    int64_t heads,
+    int64_t head_dim) {
+    if (slot < 0 || slot >= cache.shape.dims[0]) {
+        throw std::runtime_error("Higgs TTS AR batch cache view slot is out of range");
+    }
+    if (start < 0 || steps <= 0 || start + steps > cache.shape.dims[1]) {
+        throw std::runtime_error("Higgs TTS AR batch cache view range is invalid");
+    }
+    return core::wrap_tensor(
+        ggml_view_4d(
+            ctx.ggml,
+            cache.tensor,
+            head_dim,
+            heads,
+            steps,
+            1,
+            cache.tensor->nb[1],
+            cache.tensor->nb[2],
+            cache.tensor->nb[3],
+            static_cast<size_t>(slot) * cache.tensor->nb[3] +
+                static_cast<size_t>(start) * cache.tensor->nb[2]),
         core::TensorShape::from_dims({1, steps, heads, head_dim}),
         cache.type);
 }
@@ -262,6 +304,26 @@ core::TensorValue build_higgs_decode_code_embedding(
     return core::reshape_tensor(ctx, code, core::TensorShape::from_dims({1, 1, config.text.hidden_size}));
 }
 
+// Batched counterpart of build_higgs_decode_code_embedding: one code row per
+// slot, summed over codebooks, shaped so the batch lands in ggml's ne[3].
+core::TensorValue build_higgs_batch_decode_code_embedding(
+    core::ModuleBuildContext & ctx,
+    const HiggsARWeights & weights,
+    const HiggsConfig & config,
+    ggml_tensor * fused_code_ids,
+    int64_t slots) {
+    auto code_ids = core::wrap_tensor(
+        fused_code_ids,
+        core::TensorShape::from_dims({slots, config.audio.num_codebooks}),
+        GGML_TYPE_I32);
+    auto code = modules::EmbeddingModule(
+                    {config.audio.num_codebooks * config.audio.vocab_size, config.text.hidden_size})
+                    .build(ctx, code_ids, weights.modality_embedding);
+    code = modules::ReduceSumModule({1}).build(ctx, code);
+    return core::reshape_tensor(
+        ctx, code, core::TensorShape::from_dims({slots, 1, config.text.hidden_size}));
+}
+
 core::TensorValue build_higgs_prefill_input_embedding(
     core::ModuleBuildContext & ctx,
     const HiggsARWeights & weights,
@@ -323,6 +385,30 @@ core::TensorValue build_modality_logits(
         ctx,
         logits,
         core::TensorShape::from_dims({config.audio.num_codebooks, config.audio.vocab_size}));
+}
+
+core::TensorValue build_batch_modality_logits(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & hidden,
+    const HiggsARWeights & weights,
+    const HiggsConfig & config,
+    int64_t slots) {
+    const int64_t out_features = config.audio.num_codebooks * config.audio.vocab_size;
+    // dims[1] is the step count, which stays 1 per slot, so the CUDA fast
+    // projection remains available in the batched graph as well.
+    const bool use_fast_projection =
+        ctx.backend_type == core::BackendType::Cuda && hidden.shape.rank == 3 &&
+        hidden.shape.dims[1] == 1 && out_features % 4 == 0;
+    auto logits =
+        use_fast_projection
+            ? modules::FastPackedProjection4Module({config.text.hidden_size, out_features, GGML_PREC_F32})
+                  .build(ctx, hidden, {weights.modality_embedding, std::nullopt})
+            : modules::LinearModule({config.text.hidden_size, out_features, false, GGML_PREC_F32})
+                  .build(ctx, hidden, {weights.modality_embedding, std::nullopt});
+    return core::reshape_tensor(
+        ctx,
+        logits,
+        core::TensorShape::from_dims({slots, config.audio.num_codebooks, config.audio.vocab_size}));
 }
 
 }  // namespace
@@ -552,6 +638,576 @@ const core::TensorValue & HiggsARKVCache::key_tensor(size_t layer) const {
 
 const core::TensorValue & HiggsARKVCache::value_tensor(size_t layer) const {
     return impl_->cache.value_tensor(layer);
+}
+
+struct HiggsARBatchKVCache::Impl {
+    Impl(std::shared_ptr<HiggsARRuntime> input_runtime, int64_t input_slots, int64_t input_cache_steps)
+        : runtime(std::move(input_runtime)),
+          slots(input_slots),
+          cache_steps(input_cache_steps) {
+        if (runtime == nullptr) {
+            throw std::runtime_error("Higgs TTS AR batch KV cache requires runtime");
+        }
+        if (slots <= 0) {
+            throw std::runtime_error("Higgs TTS AR batch KV cache requires a positive slot count");
+        }
+        if (cache_steps <= 0) {
+            throw std::runtime_error("Higgs TTS AR batch KV cache requires positive capacity");
+        }
+        const auto & config = runtime->assets().config;
+        const auto & tensor_weights = runtime->weights();
+        const int64_t dim = config.text.head_dim;
+        ggml_init_params params{4 * 1024 * 1024, nullptr, true};
+        ctx.reset(ggml_init(params));
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to initialize Higgs TTS AR batch KV cache context");
+        }
+        core::ModuleBuildContext build_ctx{
+            ctx.get(), "higgs_audio_tts.ar.batch_kv_cache", runtime->backend_type()};
+        keys.reserve(tensor_weights.decoder.layers.size());
+        values.reserve(tensor_weights.decoder.layers.size());
+        for (size_t layer = 0; layer < tensor_weights.decoder.layers.size(); ++layer) {
+            keys.push_back(core::make_tensor(
+                build_ctx,
+                GGML_TYPE_F16,
+                core::TensorShape::from_dims(
+                    {slots, cache_steps, config.text.num_key_value_heads, dim})));
+            values.push_back(core::make_tensor(
+                build_ctx,
+                GGML_TYPE_F16,
+                core::TensorShape::from_dims(
+                    {slots, cache_steps, config.text.num_key_value_heads, dim})));
+        }
+        buffer = ggml_backend_alloc_ctx_tensors(ctx.get(), runtime->backend());
+        if (buffer == nullptr) {
+            throw std::runtime_error("failed to allocate Higgs TTS AR batch KV cache");
+        }
+        // Left padding and not-yet-written steps are masked out during decode,
+        // but flash attention still reads them, so they must not hold garbage.
+        for (size_t layer = 0; layer < keys.size(); ++layer) {
+            ggml_backend_tensor_memset(keys[layer].tensor, 0, 0, ggml_nbytes(keys[layer].tensor));
+            ggml_backend_tensor_memset(values[layer].tensor, 0, 0, ggml_nbytes(values[layer].tensor));
+        }
+    }
+
+    ~Impl() {
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+
+    std::shared_ptr<HiggsARRuntime> runtime;
+    int64_t slots = 0;
+    int64_t cache_steps = 0;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx;
+    std::vector<core::TensorValue> keys;
+    std::vector<core::TensorValue> values;
+    ggml_backend_buffer_t buffer = nullptr;
+};
+
+HiggsARBatchKVCache::HiggsARBatchKVCache(
+    std::shared_ptr<HiggsARRuntime> runtime,
+    int64_t slots,
+    int64_t cache_steps)
+    : impl_(std::make_unique<Impl>(std::move(runtime), slots, cache_steps)) {}
+
+HiggsARBatchKVCache::~HiggsARBatchKVCache() = default;
+
+int64_t HiggsARBatchKVCache::slots() const {
+    return impl_->slots;
+}
+
+int64_t HiggsARBatchKVCache::cache_steps() const {
+    return impl_->cache_steps;
+}
+
+const core::TensorValue & HiggsARBatchKVCache::key_tensor(size_t layer) const {
+    return impl_->keys.at(layer);
+}
+
+const core::TensorValue & HiggsARBatchKVCache::value_tensor(size_t layer) const {
+    return impl_->values.at(layer);
+}
+
+void copy_higgs_batch_kv_cache(
+    HiggsARBatchKVCache & dst,
+    const HiggsARBatchKVCache & src,
+    int64_t steps) {
+    if (dst.slots() != src.slots()) {
+        throw std::runtime_error("Higgs TTS AR batch cache copy requires matching slot counts");
+    }
+    if (steps <= 0 || steps > src.cache_steps() || steps > dst.cache_steps()) {
+        throw std::runtime_error("Higgs TTS AR batch cache copy range is invalid");
+    }
+    const auto & runtime = *src.impl_->runtime;
+    const auto & config = runtime.assets().config;
+    const size_t layer_count = src.impl_->keys.size();
+    const int64_t slots = src.slots();
+
+    // ggml_cpy writes through a view of the destination, so nothing here needs
+    // its own storage and the copy stays on the device.
+    ggml_init_params params{
+        ggml_tensor_overhead() * (8 * layer_count * static_cast<size_t>(slots) + 64) +
+            ggml_graph_overhead_custom(8192, false),
+        nullptr,
+        true};
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx(ggml_init(params));
+    if (ctx == nullptr) {
+        throw std::runtime_error("failed to initialize Higgs TTS AR batch cache copy context");
+    }
+    core::ModuleBuildContext build_ctx{
+        ctx.get(), "higgs_audio_tts.ar.batch_kv_cache.grow", runtime.backend_type()};
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 8192, false);
+    for (size_t layer = 0; layer < layer_count; ++layer) {
+        for (int64_t slot = 0; slot < slots; ++slot) {
+            const auto copy_range = [&](const core::TensorValue & source, const core::TensorValue & target) {
+                auto from = higgs_batch_cache_view(
+                    build_ctx, source, slot, 0, steps, config.text.num_key_value_heads, config.text.head_dim);
+                auto to = higgs_batch_cache_view(
+                    build_ctx, target, slot, 0, steps, config.text.num_key_value_heads, config.text.head_dim);
+                ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), from.tensor, to.tensor));
+            };
+            copy_range(src.key_tensor(layer), dst.key_tensor(layer));
+            copy_range(src.value_tensor(layer), dst.value_tensor(layer));
+        }
+    }
+    core::set_backend_threads(runtime.backend(), runtime.threads());
+    const ggml_status status = engine::core::compute_backend_graph(runtime.backend(), graph);
+    engine::core::release_backend_graph_resources(runtime.backend(), graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("Higgs TTS AR batch cache copy failed");
+    }
+}
+
+struct HiggsARBatchPrefillGraph::Impl {
+    Impl(
+        std::shared_ptr<HiggsARRuntime> input_runtime,
+        HiggsARBatchKVCache & input_cache,
+        int64_t input_slot,
+        int64_t input_prompt_steps,
+        int64_t input_cache_offset,
+        size_t graph_arena_bytes)
+        : runtime(std::move(input_runtime)),
+          cache(&input_cache),
+          slot(input_slot),
+          prompt_steps(input_prompt_steps) {
+        if (runtime == nullptr) {
+            throw std::runtime_error("Higgs TTS AR batch prefill graph requires runtime");
+        }
+        if (prompt_steps <= 0) {
+            throw std::runtime_error("Higgs TTS AR batch prefill graph requires a positive prompt");
+        }
+        if (input_cache_offset < 0 || input_cache_offset + prompt_steps > cache->cache_steps()) {
+            throw std::runtime_error("Higgs TTS AR batch prefill does not fit the cache");
+        }
+        ggml_init_params params{graph_arena_bytes, nullptr, true};
+        ctx.reset(ggml_init(params));
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to initialize Higgs TTS AR batch prefill graph context");
+        }
+        const auto & config = runtime->assets().config;
+        const auto & tensor_weights = runtime->weights();
+        core::ModuleBuildContext build_ctx{
+            ctx.get(), "higgs_audio_tts.ar.batch_prefill", runtime->backend_type()};
+
+        text_tokens = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, prompt_steps);
+        fused_code_ids =
+            ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, config.audio.num_codebooks, prompt_steps);
+        text_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, prompt_steps, 1);
+        code_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, prompt_steps, 1);
+        auto x = build_higgs_prefill_input_embedding(
+            build_ctx,
+            tensor_weights,
+            config,
+            text_tokens,
+            fused_code_ids,
+            text_gate,
+            code_gate,
+            prompt_steps);
+        positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, prompt_steps);
+        auto positions_value =
+            core::wrap_tensor(positions, core::TensorShape::from_dims({prompt_steps}), GGML_TYPE_I32);
+        attention_mask =
+            ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, prompt_steps, prompt_steps, 1, 1);
+        auto attention_mask_value = core::wrap_tensor(
+            attention_mask,
+            core::TensorShape::from_dims({1, 1, prompt_steps, prompt_steps}),
+            GGML_TYPE_F16);
+
+        graph = ggml_new_graph_custom(ctx.get(), 262144, false);
+        const HiggsQwenDecoderComponent decoder(config.text, tensor_weights.packed_qkv);
+        for (size_t layer_index = 0; layer_index < tensor_weights.decoder.layers.size(); ++layer_index) {
+            auto out = decoder.build_prefill_layer(
+                build_ctx,
+                x,
+                positions_value,
+                tensor_weights.decoder.layers[layer_index],
+                attention_mask_value);
+            x = out.output;
+            auto key_dest = higgs_batch_cache_view(
+                build_ctx,
+                cache->key_tensor(layer_index),
+                slot,
+                input_cache_offset,
+                prompt_steps,
+                config.text.num_key_value_heads,
+                config.text.head_dim);
+            auto value_dest = higgs_batch_cache_view(
+                build_ctx,
+                cache->value_tensor(layer_index),
+                slot,
+                input_cache_offset,
+                prompt_steps,
+                config.text.num_key_value_heads,
+                config.text.head_dim);
+            ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), out.key.tensor, key_dest.tensor));
+            ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), out.value.tensor, value_dest.tensor));
+        }
+
+        x = modules::SliceModule({1, prompt_steps - 1, 1}).build(build_ctx, x);
+        x = modules::RMSNormModule({config.text.hidden_size, config.text.rms_norm_eps, true, false})
+                .build(build_ctx, x, {tensor_weights.norm, std::nullopt});
+        auto logits = build_modality_logits(build_ctx, x, tensor_weights, config);
+        logits_output = logits.tensor;
+        ggml_set_output(logits_output);
+        ggml_build_forward_expand(graph, logits_output);
+
+        buffer = ggml_backend_alloc_ctx_tensors(ctx.get(), runtime->backend());
+        if (buffer == nullptr) {
+            throw std::runtime_error("failed to allocate Higgs TTS AR batch prefill graph");
+        }
+        // Positions are shifted by the left padding so that every slot's first
+        // generated token lands on the same position, which is what lets one
+        // shared position vector drive the batched decode graph.
+        positions_values = modules::qwen_position_ids(prompt_steps, input_cache_offset);
+        attention_mask_values = modules::qwen_causal_prefill_mask_values(1, prompt_steps);
+    }
+
+    ~Impl() {
+        engine::core::release_backend_graph_resources(runtime->backend(), graph);
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+
+    HiggsARDecodeOutput run(const HiggsARPrefillInput & input) {
+        const auto & config = runtime->assets().config;
+        if (input.steps != prompt_steps ||
+            static_cast<int64_t>(input.text_tokens.size()) != prompt_steps ||
+            static_cast<int64_t>(input.fused_code_ids.size()) != prompt_steps * config.audio.num_codebooks ||
+            static_cast<int64_t>(input.text_gate.size()) != prompt_steps ||
+            static_cast<int64_t>(input.code_gate.size()) != prompt_steps) {
+            throw std::runtime_error("Higgs TTS AR batch prefill input shape mismatch");
+        }
+        ggml_backend_tensor_set(
+            text_tokens, input.text_tokens.data(), 0, input.text_tokens.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(
+            fused_code_ids, input.fused_code_ids.data(), 0, input.fused_code_ids.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(text_gate, input.text_gate.data(), 0, input.text_gate.size() * sizeof(float));
+        ggml_backend_tensor_set(code_gate, input.code_gate.data(), 0, input.code_gate.size() * sizeof(float));
+        ggml_backend_tensor_set(
+            positions, positions_values.data(), 0, positions_values.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(
+            attention_mask,
+            attention_mask_values.data(),
+            0,
+            attention_mask_values.size() * sizeof(ggml_fp16_t));
+
+        core::set_backend_threads(runtime->backend(), runtime->threads());
+        const ggml_status status = engine::core::compute_backend_graph(runtime->backend(), graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Higgs TTS AR batch prefill graph compute failed");
+        }
+        HiggsARDecodeOutput out;
+        out.codebook_logits.resize(
+            static_cast<size_t>(config.audio.num_codebooks * config.audio.vocab_size));
+        ggml_backend_tensor_get(
+            logits_output, out.codebook_logits.data(), 0, out.codebook_logits.size() * sizeof(float));
+        return out;
+    }
+
+    std::shared_ptr<HiggsARRuntime> runtime;
+    HiggsARBatchKVCache * cache = nullptr;
+    int64_t slot = 0;
+    int64_t prompt_steps = 0;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx;
+    ggml_tensor * text_tokens = nullptr;
+    ggml_tensor * fused_code_ids = nullptr;
+    ggml_tensor * text_gate = nullptr;
+    ggml_tensor * code_gate = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * attention_mask = nullptr;
+    ggml_tensor * logits_output = nullptr;
+    std::vector<int32_t> positions_values;
+    std::vector<ggml_fp16_t> attention_mask_values;
+    ggml_cgraph * graph = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+};
+
+HiggsARBatchPrefillGraph::HiggsARBatchPrefillGraph(
+    std::shared_ptr<HiggsARRuntime> runtime,
+    HiggsARBatchKVCache & cache,
+    int64_t slot,
+    int64_t prompt_steps,
+    int64_t cache_offset,
+    size_t graph_arena_bytes)
+    : impl_(std::make_unique<Impl>(
+          std::move(runtime), cache, slot, prompt_steps, cache_offset, graph_arena_bytes)) {}
+
+HiggsARBatchPrefillGraph::~HiggsARBatchPrefillGraph() = default;
+
+HiggsARDecodeOutput HiggsARBatchPrefillGraph::run(const HiggsARPrefillInput & input) {
+    return impl_->run(input);
+}
+
+struct HiggsARBatchDecodeGraph::Impl {
+    Impl(
+        std::shared_ptr<HiggsARRuntime> input_runtime,
+        HiggsARBatchKVCache & input_cache,
+        size_t graph_arena_bytes)
+        : runtime(std::move(input_runtime)),
+          cache(&input_cache),
+          slots(input_cache.slots()),
+          cache_steps(input_cache.cache_steps()) {
+        if (runtime == nullptr) {
+            throw std::runtime_error("Higgs TTS AR batch decode graph requires runtime");
+        }
+        const auto build_start = Clock::now();
+        ggml_init_params params{graph_arena_bytes, nullptr, true};
+        ctx.reset(ggml_init(params));
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to initialize Higgs TTS AR batch decode graph context");
+        }
+        const auto & config = runtime->assets().config;
+        const auto & tensor_weights = runtime->weights();
+        core::ModuleBuildContext build_ctx{
+            ctx.get(), "higgs_audio_tts.ar.batch_decode", runtime->backend_type()};
+
+        fused_code_ids =
+            ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, config.audio.num_codebooks, slots);
+        auto x = build_higgs_batch_decode_code_embedding(
+            build_ctx, tensor_weights, config, fused_code_ids, slots);
+
+        // One shared position for the whole batch: ggml requires the position
+        // vector to match the token axis, not the batch axis, and left padding
+        // has already aligned every slot onto the same position.
+        positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+        auto positions_value =
+            core::wrap_tensor(positions, core::TensorShape::from_dims({1}), GGML_TYPE_I32);
+        cache_slot = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, slots);
+        auto cache_slot_value =
+            core::wrap_tensor(cache_slot, core::TensorShape::from_dims({slots}), GGML_TYPE_I64);
+        attention_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, cache_steps, 1, 1, slots);
+        auto attention_mask_value = core::wrap_tensor(
+            attention_mask,
+            core::TensorShape::from_dims({slots, 1, 1, cache_steps}),
+            GGML_TYPE_F16);
+
+        graph = ggml_new_graph_custom(ctx.get(), 65536, false);
+        const HiggsQwenDecoderComponent decoder(
+            config.text, tensor_weights.packed_qkv, GGML_PREC_F32);
+        for (size_t layer_index = 0; layer_index < tensor_weights.decoder.layers.size(); ++layer_index) {
+            auto out = decoder.build_decode_layer(
+                build_ctx,
+                graph,
+                x,
+                positions_value,
+                tensor_weights.decoder.layers[layer_index],
+                cache->key_tensor(layer_index),
+                cache->value_tensor(layer_index),
+                cache_slot_value,
+                attention_mask_value);
+            x = out.output;
+        }
+
+        x = modules::RMSNormModule({config.text.hidden_size, config.text.rms_norm_eps, true, false})
+                .build(build_ctx, x, {tensor_weights.norm, std::nullopt});
+        auto logits = build_batch_modality_logits(build_ctx, x, tensor_weights, config, slots);
+        logits_output = logits.tensor;
+        ggml_set_output(logits_output);
+        ggml_build_forward_expand(graph, logits_output);
+
+        buffer = ggml_backend_alloc_ctx_tensors(ctx.get(), runtime->backend());
+        if (buffer == nullptr) {
+            throw std::runtime_error("failed to allocate Higgs TTS AR batch decode graph");
+        }
+        core::set_backend_threads(runtime->backend(), runtime->threads());
+        fused_code_id_values.assign(static_cast<size_t>(slots * config.audio.num_codebooks), 0);
+        cache_slot_values.assign(static_cast<size_t>(slots), 0);
+        attention_mask_values.assign(
+            static_cast<size_t>(slots * cache_steps), ggml_fp32_to_fp16(-INFINITY));
+        engine::debug::timing_log_scalar(
+            "higgs_audio_tts.ar.batch_decode.graph.build_ms",
+            engine::debug::elapsed_ms(build_start, Clock::now()));
+    }
+
+    ~Impl() {
+        engine::core::release_backend_graph_resources(runtime->backend(), graph);
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+
+    void begin_decode_run(
+        const std::vector<int64_t> & visible_start,
+        int64_t input_prompt_capacity,
+        int64_t generated_so_far) {
+        if (static_cast<int64_t>(visible_start.size()) != slots) {
+            throw std::runtime_error("Higgs TTS AR batch decode requires one visible start per slot");
+        }
+        if (input_prompt_capacity <= 0 || input_prompt_capacity > cache_steps) {
+            throw std::runtime_error("Higgs TTS AR batch decode prompt capacity is out of range");
+        }
+        if (generated_so_far < 0 || input_prompt_capacity + generated_so_far > cache_steps) {
+            throw std::runtime_error("Higgs TTS AR batch decode resume point is out of range");
+        }
+        prompt_capacity = input_prompt_capacity;
+        generated = generated_so_far;
+        input_upload_ms = 0.0;
+        mask_upload_ms = 0.0;
+        graph_compute_ms = 0.0;
+        output_read_ms = 0.0;
+        steps = 0;
+        std::fill(attention_mask_values.begin(), attention_mask_values.end(), ggml_fp32_to_fp16(-INFINITY));
+        for (int64_t slot_index = 0; slot_index < slots; ++slot_index) {
+            const int64_t start = visible_start[static_cast<size_t>(slot_index)];
+            if (start < 0 || start > prompt_capacity) {
+                throw std::runtime_error("Higgs TTS AR batch decode visible start is out of range");
+            }
+            const auto row = attention_mask_values.begin() +
+                static_cast<std::ptrdiff_t>(slot_index * cache_steps);
+            std::fill(
+                row + static_cast<std::ptrdiff_t>(start),
+                row + static_cast<std::ptrdiff_t>(prompt_capacity + generated),
+                ggml_fp32_to_fp16(0.0F));
+        }
+        ggml_backend_tensor_set(
+            attention_mask,
+            attention_mask_values.data(),
+            0,
+            attention_mask_values.size() * sizeof(ggml_fp16_t));
+    }
+
+    void run_step_into(const HiggsARBatchDecodeInput & input, HiggsARBatchDecodeOutput & output) {
+        const auto & config = runtime->assets().config;
+        const int64_t step_index = prompt_capacity + generated;
+        if (step_index >= cache_steps) {
+            throw std::runtime_error("Higgs TTS AR batch decode cache exhausted");
+        }
+        if (static_cast<int64_t>(input.last_codes.size()) != slots * config.audio.num_codebooks) {
+            throw std::runtime_error("Higgs TTS AR batch decode last codebook shape mismatch");
+        }
+
+        auto timing_start = Clock::now();
+        for (int64_t slot_index = 0; slot_index < slots; ++slot_index) {
+            for (int64_t codebook = 0; codebook < config.audio.num_codebooks; ++codebook) {
+                const size_t flat =
+                    static_cast<size_t>(slot_index * config.audio.num_codebooks + codebook);
+                const int32_t code = input.last_codes[flat];
+                if (code < 0 || code >= config.audio.vocab_size) {
+                    throw std::runtime_error("Higgs TTS AR batch decode codebook token is outside vocabulary");
+                }
+                fused_code_id_values[flat] =
+                    static_cast<int32_t>(code + codebook * config.audio.vocab_size);
+            }
+            cache_slot_values[static_cast<size_t>(slot_index)] = slot_index * cache_steps + step_index;
+        }
+        ggml_backend_tensor_set(
+            fused_code_ids, fused_code_id_values.data(), 0, fused_code_id_values.size() * sizeof(int32_t));
+        const int32_t position = static_cast<int32_t>(step_index);
+        ggml_backend_tensor_set(positions, &position, 0, sizeof(int32_t));
+        ggml_backend_tensor_set(
+            cache_slot, cache_slot_values.data(), 0, cache_slot_values.size() * sizeof(int64_t));
+        input_upload_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+
+        timing_start = Clock::now();
+        for (int64_t slot_index = 0; slot_index < slots; ++slot_index) {
+            attention_mask_values[static_cast<size_t>(slot_index * cache_steps + step_index)] =
+                ggml_fp32_to_fp16(0.0F);
+        }
+        ggml_backend_tensor_set(
+            attention_mask,
+            attention_mask_values.data(),
+            0,
+            attention_mask_values.size() * sizeof(ggml_fp16_t));
+        mask_upload_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+
+        timing_start = Clock::now();
+        const ggml_status status = engine::core::compute_backend_graph(runtime->backend(), graph);
+        if (engine::debug::timing_log_enabled()) {
+            ggml_backend_synchronize(runtime->backend());
+        }
+        graph_compute_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Higgs TTS AR batch decode graph compute failed");
+        }
+
+        output.codebook_logits.resize(
+            static_cast<size_t>(slots * config.audio.num_codebooks * config.audio.vocab_size));
+        timing_start = Clock::now();
+        ggml_backend_tensor_get(
+            logits_output, output.codebook_logits.data(), 0, output.codebook_logits.size() * sizeof(float));
+        output_read_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+
+        ++generated;
+        ++steps;
+    }
+
+    HiggsARDecodeTiming timing() const {
+        return {input_upload_ms, mask_upload_ms, graph_compute_ms, output_read_ms, steps};
+    }
+
+    std::shared_ptr<HiggsARRuntime> runtime;
+    HiggsARBatchKVCache * cache = nullptr;
+    int64_t slots = 0;
+    int64_t cache_steps = 0;
+    int64_t prompt_capacity = 0;
+    int64_t generated = 0;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx;
+    ggml_tensor * fused_code_ids = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * cache_slot = nullptr;
+    ggml_tensor * attention_mask = nullptr;
+    ggml_tensor * logits_output = nullptr;
+    std::vector<int32_t> fused_code_id_values;
+    std::vector<int64_t> cache_slot_values;
+    std::vector<ggml_fp16_t> attention_mask_values;
+    ggml_cgraph * graph = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    double input_upload_ms = 0.0;
+    double mask_upload_ms = 0.0;
+    double graph_compute_ms = 0.0;
+    double output_read_ms = 0.0;
+    int64_t steps = 0;
+};
+
+HiggsARBatchDecodeGraph::HiggsARBatchDecodeGraph(
+    std::shared_ptr<HiggsARRuntime> runtime,
+    HiggsARBatchKVCache & cache,
+    size_t graph_arena_bytes)
+    : impl_(std::make_unique<Impl>(std::move(runtime), cache, graph_arena_bytes)) {}
+
+HiggsARBatchDecodeGraph::~HiggsARBatchDecodeGraph() = default;
+
+void HiggsARBatchDecodeGraph::begin_decode_run(
+    const std::vector<int64_t> & visible_start,
+    int64_t prompt_capacity,
+    int64_t generated_so_far) {
+    impl_->begin_decode_run(visible_start, prompt_capacity, generated_so_far);
+}
+
+void HiggsARBatchDecodeGraph::run_step_into(
+    const HiggsARBatchDecodeInput & input,
+    HiggsARBatchDecodeOutput & output) {
+    impl_->run_step_into(input, output);
+}
+
+int64_t HiggsARBatchDecodeGraph::generated_steps() const {
+    return impl_->generated;
+}
+
+HiggsARDecodeTiming HiggsARBatchDecodeGraph::timing() const {
+    return impl_->timing();
 }
 
 struct HiggsARDecodeGraph::Impl {

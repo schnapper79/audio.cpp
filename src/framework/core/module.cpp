@@ -162,7 +162,10 @@ TensorValue reshape_tensor(ModuleBuildContext & ctx, const TensorValue & value, 
         throw std::runtime_error("Cannot reshape an invalid tensor");
     }
     if (value.shape.num_elements() != new_shape.num_elements()) {
-        throw std::runtime_error("Reshape element count mismatch");
+        throw std::runtime_error(
+            "Reshape element count mismatch: " + value.shape.to_string() + " -> " +
+            new_shape.to_string() + " in " +
+            (ctx.module_instance_name != nullptr ? ctx.module_instance_name : "<unnamed>"));
     }
     if (ctx.ggml == nullptr) {
         throw std::runtime_error("ModuleBuildContext.ggml is null");

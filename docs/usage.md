@@ -88,6 +88,8 @@ audiocpp_cli --task tts --family pocket_tts \
 
 For each request id, `--metrics` prints `metrics[<id>].wall_ms`, `audio_duration_ms`, `rtf`, `x_realtime`, `sample_rate`, and `channels`.
 
+Batch inputs run one request after another through the session by default. Families that support batched decoding can run several requests in one forward pass instead, which raises throughput on memory-bandwidth-bound autoregressive models. Higgs Audio v3 TTS exposes this through `--session-option higgs_audio_tts.max_batch=<n>`; see [tts.md](tts.md#batched-offline-generation). When a batch runs together there is no per-request wall time, so `metrics[<id>].wall_ms` reports the amortized share of the batch.
+
 ## Model Docs
 
 | Need | Doc |

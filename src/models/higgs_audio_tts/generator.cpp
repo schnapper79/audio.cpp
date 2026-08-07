@@ -138,6 +138,24 @@ HiggsPreparedPrompt make_prepared_prompt(const HiggsPromptEncoding & prompt,
     return prepared;
 }
 
+void validate_reference_shape(const HiggsGenerationRequest & request, const HiggsConfig & config) {
+    const bool has_reference = request.reference_frames > 0 || !request.reference_codes.empty();
+    if (has_reference) {
+        if (request.reference_frames <= 0 ||
+            request.reference_codebooks != config.audio.num_codebooks) {
+            throw std::runtime_error("Higgs TTS generation requires reference codes "
+                                     "shaped [frames, num_codebooks]");
+        }
+        if (static_cast<int64_t>(request.reference_codes.size()) !=
+            request.reference_frames * request.reference_codebooks) {
+            throw std::runtime_error("Higgs TTS generation reference code count mismatch");
+        }
+    } else if (request.reference_codebooks != 0) {
+        throw std::runtime_error(
+            "Higgs TTS generation got reference codebooks without reference codes");
+    }
+}
+
 } // namespace
 
 HiggsGenerator::HiggsGenerator(std::shared_ptr<const HiggsAssets> assets,
@@ -235,6 +253,296 @@ void HiggsGenerator::prepare(const HiggsGenerationRequest & request) {
         reference_prefix_cache_.reset();
         reference_kv_ready_ = false;
     }
+}
+
+std::vector<HiggsGenerationResult> HiggsGenerator::generate_batch(
+    const std::vector<HiggsGenerationRequest> & requests) {
+    if (requests.empty()) {
+        throw std::runtime_error("Higgs TTS batch generation requires at least one request");
+    }
+    if (requests.size() == 1) {
+        // Nothing to amortize, and the single-sequence path is the tuned one.
+        return {generate(requests.front())};
+    }
+
+    const auto & config = assets_->config;
+    const int64_t slots = static_cast<int64_t>(requests.size());
+    const int64_t codebooks = config.audio.num_codebooks;
+    const int64_t vocab = config.audio.vocab_size;
+    const auto batch_start = Clock::now();
+
+    struct SlotPlan {
+        HiggsPreparedPrompt prepared;
+        int64_t prompt_steps = 0;
+        int64_t max_tokens = 0;
+    };
+    std::vector<SlotPlan> plans;
+    plans.reserve(requests.size());
+    for (const auto & request : requests) {
+        validate_reference_shape(request, config);
+        validate_generation_options(request.options);
+        const bool has_reference = request.reference_frames > 0 || !request.reference_codes.empty();
+        std::vector<int32_t> delayed_reference_codes;
+        int64_t delayed_reference_frames = 0;
+        if (has_reference) {
+            delayed_reference_codes = apply_higgs_delay_pattern(
+                request.reference_codes, request.reference_frames, request.reference_codebooks);
+            delayed_reference_frames =
+                higgs_delayed_frame_count(request.reference_frames, request.reference_codebooks);
+        }
+        const HiggsPromptEncoding prompt = tokenizer_.encode_prompt({
+            request.text,
+            request.reference_text,
+            delayed_reference_frames,
+        });
+        SlotPlan plan;
+        plan.prepared = make_prepared_prompt(
+            prompt, delayed_reference_codes, delayed_reference_frames, config);
+        plan.prompt_steps = plan.prepared.ar_input.steps;
+        plan.max_tokens = request.options.max_tokens;
+        if (plan.prompt_steps + plan.max_tokens > config.text.max_position_embeddings) {
+            throw std::runtime_error("Higgs TTS generation exceeds text model max_position_embeddings");
+        }
+        plans.push_back(std::move(plan));
+    }
+
+    int64_t prompt_capacity = 0;
+    int64_t max_new_tokens = 0;
+    for (const auto & plan : plans) {
+        prompt_capacity = std::max(prompt_capacity, plan.prompt_steps);
+        max_new_tokens = std::max(max_new_tokens, plan.max_tokens);
+    }
+    const int64_t max_cache_steps = prompt_capacity + max_new_tokens;
+    // Flash attention reads the whole allocated window every step, so an
+    // oversized cache is paid for on every token of every slot. Start at the
+    // same bucket the single path uses and grow on demand instead.
+    const int64_t cache_steps = bucketed_initial_cache_steps(prompt_capacity, max_new_tokens);
+
+    // The batched cache is sized once for the worst case; unlike the single
+    // path there is no mid-run growth, because growing would mean relocating
+    // every slot at once.
+    prefill_graph_.reset();
+    decode_graph_.reset();
+    ar_kv_cache_.reset();
+    reference_kv_ready_ = false;
+
+    engine::debug::trace_log_scalar("higgs_audio_tts.batch.slots", slots);
+    engine::debug::trace_log_scalar("higgs_audio_tts.batch.prompt_capacity", prompt_capacity);
+    engine::debug::trace_log_scalar("higgs_audio_tts.batch.cache_steps", cache_steps);
+
+    auto cache = std::make_unique<HiggsARBatchKVCache>(ar_, slots, cache_steps);
+
+    const auto prefill_start = Clock::now();
+    std::vector<int64_t> visible_start(static_cast<size_t>(slots), 0);
+    std::vector<HiggsARDecodeOutput> prefill_logits(static_cast<size_t>(slots));
+    for (int64_t slot = 0; slot < slots; ++slot) {
+        const auto & plan = plans[static_cast<size_t>(slot)];
+        visible_start[static_cast<size_t>(slot)] = prompt_capacity - plan.prompt_steps;
+        HiggsARBatchPrefillGraph prefill(
+            ar_,
+            *cache,
+            slot,
+            plan.prompt_steps,
+            visible_start[static_cast<size_t>(slot)],
+            ar_decode_graph_arena_bytes_);
+        prefill_logits[static_cast<size_t>(slot)] = prefill.run(plan.prepared.ar_input);
+    }
+    engine::debug::timing_log_scalar(
+        "higgs_audio_tts.batch.prefill_ms", engine::debug::elapsed_ms(prefill_start, Clock::now()));
+
+    HiggsCodebookSampler sampler(codebooks, vocab);
+    std::vector<HiggsSamplerState> states;
+    std::vector<HiggsSamplingOptions> samplings;
+    std::vector<std::unique_ptr<std::mt19937>> fallback_rngs;
+    states.reserve(requests.size());
+    samplings.reserve(requests.size());
+    fallback_rngs.reserve(requests.size());
+    for (const auto & request : requests) {
+        states.push_back(sampler.make_state());
+        HiggsSamplingOptions sampling;
+        sampling.temperature = request.options.temperature;
+        sampling.top_p = request.options.top_p;
+        sampling.top_k = request.options.top_k;
+        sampling.has_seed = request.options.seed.has_value();
+        sampling.seed = request.options.seed.value_or(runtime::random_u64_seed());
+        fallback_rngs.push_back(
+            std::make_unique<std::mt19937>(static_cast<uint32_t>(sampling.seed)));
+        sampling.fallback_rng = fallback_rngs.back().get();
+        if (!sampling.has_seed && !cuda_sampling_policy_.has_value()) {
+            cuda_sampling_policy_ = engine::sampling::resolve_torch_cuda_sampling_policy(
+                ar_->backend_type(),
+                ar_->device(),
+                "higgs_audio_tts.cuda_sampling_policy",
+                "Higgs TTS",
+                engine::sampling::TorchCudaSamplingPolicyFailureMode::FallbackToDefault);
+        }
+        if (cuda_sampling_policy_.has_value()) {
+            sampling.cuda_policy = *cuda_sampling_policy_;
+        }
+        samplings.push_back(sampling);
+    }
+
+    std::vector<HiggsGenerationResult> results(static_cast<size_t>(slots));
+    for (int64_t slot = 0; slot < slots; ++slot) {
+        const auto index = static_cast<size_t>(slot);
+        auto & result = results[index];
+        result.delayed_codes.reserve(
+            static_cast<size_t>(plans[index].max_tokens * codebooks));
+        const auto & sampled = sampler.step(
+            prefill_logits[index].codebook_logits.data(),
+            static_cast<int64_t>(prefill_logits[index].codebook_logits.size()),
+            states[index],
+            samplings[index]);
+        result.delayed_codes.insert(result.delayed_codes.end(), sampled.begin(), sampled.end());
+        result.delayed_frames += 1;
+        engine::debug::trace_log_i32(
+            "higgs_audio_tts.batch.slot" + std::to_string(slot) + ".first_output_codes",
+            {static_cast<int64_t>(sampled.size())},
+            sampled);
+    }
+
+    const auto decode_start = Clock::now();
+    auto decode_graph =
+        std::make_unique<HiggsARBatchDecodeGraph>(ar_, *cache, ar_decode_graph_arena_bytes_);
+    decode_graph->begin_decode_run(visible_start, prompt_capacity);
+    HiggsARDecodeTiming decode_timing_total;
+    int64_t generated_steps = 0;
+
+    const auto slot_active = [&](size_t index) {
+        return !states[index].generation_done &&
+            results[index].delayed_frames < plans[index].max_tokens;
+    };
+
+    HiggsARBatchDecodeInput input;
+    input.last_codes.assign(static_cast<size_t>(slots * codebooks), 0);
+    HiggsARBatchDecodeOutput decoded;
+    double sampler_total_ms = 0.0;
+    while (true) {
+        bool any_active = false;
+        for (int64_t slot = 0; slot < slots; ++slot) {
+            if (slot_active(static_cast<size_t>(slot))) {
+                any_active = true;
+                break;
+            }
+        }
+        if (!any_active) {
+            break;
+        }
+        if (prompt_capacity + generated_steps >= cache->cache_steps()) {
+            const int64_t valid_steps = prompt_capacity + generated_steps;
+            const int64_t grown_cache_steps = std::min(
+                max_cache_steps, std::max(cache->cache_steps() * 2, valid_steps + 1));
+            if (grown_cache_steps <= cache->cache_steps()) {
+                throw std::runtime_error("Higgs TTS AR batch cache cannot grow");
+            }
+            decode_timing_total.add(decode_graph->timing());
+            decode_graph.reset();
+            auto grown = std::make_unique<HiggsARBatchKVCache>(ar_, slots, grown_cache_steps);
+            copy_higgs_batch_kv_cache(*grown, *cache, valid_steps);
+            cache = std::move(grown);
+            engine::debug::trace_log_scalar(
+                "higgs_audio_tts.batch.kv_cache_grown_steps", grown_cache_steps);
+            decode_graph = std::make_unique<HiggsARBatchDecodeGraph>(
+                ar_, *cache, ar_decode_graph_arena_bytes_);
+            decode_graph->begin_decode_run(visible_start, prompt_capacity, generated_steps);
+        }
+        // Finished slots keep riding along with their last valid codes. Their
+        // outputs are ignored; dropping them from the batch would mean
+        // rebuilding the graph, and the weight read they share is already paid.
+        for (int64_t slot = 0; slot < slots; ++slot) {
+            const auto index = static_cast<size_t>(slot);
+            const auto & last_codes = states[index].last_codes;
+            if (static_cast<int64_t>(last_codes.size()) != codebooks) {
+                throw std::runtime_error("Higgs TTS batch decode slot has no valid last codes");
+            }
+            std::copy(
+                last_codes.begin(),
+                last_codes.end(),
+                input.last_codes.begin() + static_cast<std::ptrdiff_t>(slot * codebooks));
+        }
+        decode_graph->run_step_into(input, decoded);
+        if (generated_steps == 0) {
+            engine::debug::trace_log_f32(
+                "higgs_audio_tts.batch.slot0.decode.step0.logits",
+                {codebooks, vocab},
+                std::vector<float>(
+                    decoded.codebook_logits.begin(),
+                    decoded.codebook_logits.begin() + static_cast<std::ptrdiff_t>(codebooks * vocab)));
+        }
+        ++generated_steps;
+        const auto sample_start = Clock::now();
+        for (int64_t slot = 0; slot < slots; ++slot) {
+            const auto index = static_cast<size_t>(slot);
+            if (!slot_active(index)) {
+                continue;
+            }
+            const float * logits =
+                decoded.codebook_logits.data() + static_cast<size_t>(slot * codebooks * vocab);
+            const auto & sampled =
+                sampler.step(logits, codebooks * vocab, states[index], samplings[index]);
+            if (!sampled.empty() && sampled.front() != kHiggsStopCode) {
+                results[index].delayed_codes.insert(
+                    results[index].delayed_codes.end(), sampled.begin(), sampled.end());
+                results[index].delayed_frames += 1;
+            }
+        }
+        sampler_total_ms += engine::debug::elapsed_ms(sample_start, Clock::now());
+    }
+
+    decode_timing_total.add(decode_graph->timing());
+    const auto & decode_timing = decode_timing_total;
+    engine::debug::timing_log_scalar("higgs_audio_tts.batch.decode.steps", decode_timing.steps);
+    engine::debug::timing_log_scalar(
+        "higgs_audio_tts.batch.decode.graph.compute_ms", decode_timing.graph_compute_ms);
+    engine::debug::timing_log_scalar(
+        "higgs_audio_tts.batch.decode.input_upload_ms", decode_timing.input_upload_ms);
+    engine::debug::timing_log_scalar(
+        "higgs_audio_tts.batch.decode.mask_upload_ms", decode_timing.mask_upload_ms);
+    engine::debug::timing_log_scalar(
+        "higgs_audio_tts.batch.decode.output_read_ms", decode_timing.output_read_ms);
+    engine::debug::timing_log_scalar("higgs_audio_tts.batch.decode.sampler_ms", sampler_total_ms);
+    engine::debug::timing_log_scalar(
+        "higgs_audio_tts.batch.decode_ms", engine::debug::elapsed_ms(decode_start, Clock::now()));
+
+    const int32_t codec_vocab = static_cast<int32_t>(config.audio.vocab_size - 2);
+    const auto codec_start = Clock::now();
+    for (int64_t slot = 0; slot < slots; ++slot) {
+        const auto index = static_cast<size_t>(slot);
+        if (!states[index].generation_done) {
+            throw std::runtime_error(
+                "Higgs TTS batch generation reached max_tokens before EOC in slot " +
+                std::to_string(slot));
+        }
+        auto & result = results[index];
+        // Fixed-size head so the values line up with the single path's
+        // delayed_codes_head8 trace and can be diffed directly.
+        const int64_t delayed_head_rows = std::min<int64_t>(result.delayed_frames, 8);
+        engine::debug::trace_log_i32(
+            "higgs_audio_tts.batch.slot" + std::to_string(slot) + ".delayed_codes_head8",
+            {delayed_head_rows, codebooks},
+            std::vector<int32_t>(
+                result.delayed_codes.begin(),
+                result.delayed_codes.begin() +
+                    static_cast<std::ptrdiff_t>(delayed_head_rows * codebooks)));
+        engine::debug::trace_log_scalar(
+            "higgs_audio_tts.batch.slot" + std::to_string(slot) + ".delayed_frames",
+            result.delayed_frames);
+        result.raw_codes =
+            reverse_higgs_delay_pattern(result.delayed_codes, result.delayed_frames, codebooks);
+        result.raw_frames = result.delayed_frames - (codebooks - 1);
+        for (auto & code : result.raw_codes) {
+            if (code >= codec_vocab) {
+                code = 0;
+            }
+        }
+        result.audio = codec_->decode_codes(result.raw_codes, result.raw_frames, codebooks);
+    }
+    codec_->release_runtime_graphs();
+    engine::debug::timing_log_scalar(
+        "higgs_audio_tts.batch.codec_decode_ms", engine::debug::elapsed_ms(codec_start, Clock::now()));
+    engine::debug::timing_log_scalar(
+        "higgs_audio_tts.batch.wall_ms", engine::debug::elapsed_ms(batch_start, Clock::now()));
+    return results;
 }
 
 HiggsGenerationResult HiggsGenerator::generate(const HiggsGenerationRequest & request) {
@@ -481,6 +789,9 @@ HiggsGenerationResult HiggsGenerator::generate(const HiggsGenerationRequest & re
         if (!logged_decode_step_timing) {
             engine::debug::timing_log_scalar("higgs_audio_tts.generator.decode.step0.ar_ms",
                                              engine::debug::elapsed_ms(step_start, Clock::now()));
+            engine::debug::trace_log_f32("higgs_audio_tts.generator.decode.step0.logits",
+                                         {config.audio.num_codebooks, config.audio.vocab_size},
+                                         decoded.codebook_logits);
         }
         const auto sample_start = Clock::now();
         const auto & sampled = sampler.step(decoded.codebook_logits.data(),

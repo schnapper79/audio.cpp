@@ -120,6 +120,106 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Batched decode inputs and outputs are slot-major: slot 0's values come first,
+// then slot 1's, and so on.
+struct HiggsARBatchDecodeInput {
+    std::vector<int32_t> last_codes;
+};
+
+struct HiggsARBatchDecodeOutput {
+    std::vector<float> codebook_logits;
+};
+
+// KV cache holding `slots` independent sequences.
+//
+// Sequences are stored left-padded: slot `b` with a prompt of `P_b` steps
+// occupies cache steps [prompt_capacity - P_b, prompt_capacity), so every slot
+// decodes at the same cache index and therefore at the same RoPE position.
+// That alignment is what makes a single batched decode graph possible at all --
+// ggml applies one position vector across the whole batch dimension. Shifting a
+// sequence's positions by a constant leaves attention scores unchanged, because
+// RoPE scores depend only on position differences.
+class HiggsARBatchKVCache {
+public:
+    HiggsARBatchKVCache(std::shared_ptr<HiggsARRuntime> runtime, int64_t slots, int64_t cache_steps);
+    ~HiggsARBatchKVCache();
+
+    HiggsARBatchKVCache(const HiggsARBatchKVCache &) = delete;
+    HiggsARBatchKVCache & operator=(const HiggsARBatchKVCache &) = delete;
+
+    int64_t slots() const;
+    int64_t cache_steps() const;
+    const core::TensorValue & key_tensor(size_t layer) const;
+    const core::TensorValue & value_tensor(size_t layer) const;
+
+private:
+    friend void copy_higgs_batch_kv_cache(
+        HiggsARBatchKVCache & dst,
+        const HiggsARBatchKVCache & src,
+        int64_t steps);
+
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Copies the first `steps` cache steps of every slot from `src` into `dst` on
+// the device. Used to grow a batched cache without a host round trip.
+void copy_higgs_batch_kv_cache(
+    HiggsARBatchKVCache & dst,
+    const HiggsARBatchKVCache & src,
+    int64_t steps);
+
+// Prefills one slot of a batched cache. Each slot is prefilled on its own
+// because prompt lengths differ; only the decode loop runs batched, which is
+// where the time goes.
+class HiggsARBatchPrefillGraph {
+public:
+    HiggsARBatchPrefillGraph(
+        std::shared_ptr<HiggsARRuntime> runtime,
+        HiggsARBatchKVCache & cache,
+        int64_t slot,
+        int64_t prompt_steps,
+        int64_t cache_offset,
+        size_t graph_arena_bytes);
+    ~HiggsARBatchPrefillGraph();
+
+    HiggsARBatchPrefillGraph(const HiggsARBatchPrefillGraph &) = delete;
+    HiggsARBatchPrefillGraph & operator=(const HiggsARBatchPrefillGraph &) = delete;
+
+    HiggsARDecodeOutput run(const HiggsARPrefillInput & input);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+class HiggsARBatchDecodeGraph {
+public:
+    HiggsARBatchDecodeGraph(
+        std::shared_ptr<HiggsARRuntime> runtime,
+        HiggsARBatchKVCache & cache,
+        size_t graph_arena_bytes);
+    ~HiggsARBatchDecodeGraph();
+
+    HiggsARBatchDecodeGraph(const HiggsARBatchDecodeGraph &) = delete;
+    HiggsARBatchDecodeGraph & operator=(const HiggsARBatchDecodeGraph &) = delete;
+
+    // `visible_start[b]` is slot b's left padding, `prompt_capacity` the shared
+    // cache index the first generated token is written to. `generated_so_far`
+    // resumes an in-flight run after the cache grew and the graph was rebuilt.
+    void begin_decode_run(
+        const std::vector<int64_t> & visible_start,
+        int64_t prompt_capacity,
+        int64_t generated_so_far = 0);
+    void run_step_into(const HiggsARBatchDecodeInput & input, HiggsARBatchDecodeOutput & output);
+    int64_t generated_steps() const;
+    HiggsARDecodeTiming timing() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 class HiggsARPrefillGraph {
 public:
     HiggsARPrefillGraph(

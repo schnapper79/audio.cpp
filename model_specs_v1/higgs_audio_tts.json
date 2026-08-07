@@ -162,6 +162,14 @@
         "required": false,
         "min": 0,
         "default": 1
+      },
+      {
+        "name": "max_batch",
+        "type": "int",
+        "description": "Maximum requests decoded together in one batched AR pass; default 1 (disabled). Raises offline batch throughput because the per-token weight read is shared across sequences; does not change single-request latency. VRAM grows with the KV cache per slot.",
+        "required": false,
+        "min": 1,
+        "default": 1
       }
     ],
     "load": []

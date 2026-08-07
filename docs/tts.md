@@ -440,6 +440,34 @@ python3 tools/model_manager_v2.py install --models-root models higgs_audio_tts_4
 | `--top-p` | float | `0.8` | AR nucleus sampling limit. The Python client's unfiltered equivalent is `1.0`. |
 | `--repetition-penalty` | float | `1.1` | Accepted for Python API compatibility; Higgs audio-code sampling does not consume it. |
 
+### Batched offline generation
+
+At batch 1 the AR decode is memory bandwidth bound: the full weight set is read from VRAM for every single generated token, so the GPU sits mostly idle while throughput stays low. Decoding several requests in one pass shares that read.
+
+```bash
+audiocpp_cli --task tts --family higgs_audio_tts --model models/Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-q8_0.gguf --backend cuda --session-option higgs_audio_tts.max_batch=5 --session-option higgs_audio_tts.reference_cache_slots=4 --batch-text-file lines.txt --voice-ref assets/resources/b.wav --reference-text "..." --out-dir outputs --metrics
+```
+
+| Session option | Values | Default | Meaning |
+|---|---|---:|---|
+| `higgs_audio_tts.max_batch` | integer | `1` | Requests decoded together. `1` keeps the single-sequence path. |
+| `higgs_audio_tts.reference_cache_slots` | integer | `1` | Encoded reference-audio cache slots. Set to the number of distinct voices in the batch, otherwise every request re-encodes its reference. |
+
+Measured on an RTX 4000 Ada (20 GB, ~360 GB/s) with the Q8 package, five requests sharing one voice:
+
+| | Per generated token | Batch wall time | Throughput |
+|---|---:|---:|---:|
+| Sequential (`max_batch=1`) | 14.0 ms | 11.1 s | 2.6x realtime |
+| Batched (`max_batch=5`) | 3.3 ms | 4.5 s | 6.4x realtime |
+
+Notes:
+
+- Batching raises **throughput, not per-request latency**. A single request is not faster.
+- Requests are grouped by reference voice and sorted by length internally. Slots run in lockstep until the longest one finishes, so batching requests of similar length wastes the least work.
+- VRAM grows with one KV cache per slot. The cache starts at a bucketed size and doubles on demand, so short requests do not pay for a large `--max-tokens`.
+- Batched matmuls reduce in a different order than the single-sequence path, so sampled output for a given seed is close to but not bit-identical with `max_batch=1`.
+- If any request in a batch hits `max_tokens` before its end-of-audio token, the whole batch fails. Keep `--max-tokens` generous for unattended runs.
+
 ## Fish Audio S2 Pro
 
 Fish Audio S2 Pro is a TTS and reference voice-clone model. The integration uses the framework text chunker for long-form input, caches prepared reference audio in the session, and supports GGUF loading through the package spec path.

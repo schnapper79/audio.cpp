@@ -17,7 +17,7 @@ namespace engine::models::higgs_audio_tts {
 
 class HiggsTTSSession final
     : public runtime::RuntimeSessionBase
-    , public runtime::IOfflineVoiceTaskSession {
+    , public runtime::IBatchedOfflineVoiceTaskSession {
 public:
     HiggsTTSSession(
         runtime::TaskSpec task,
@@ -29,6 +29,9 @@ public:
     runtime::RunMode run_mode() const override;
     void prepare(const runtime::SessionPreparationRequest & request) override;
     runtime::TaskResult run(const runtime::TaskRequest & request) override;
+    int64_t max_batch_size() const override;
+    std::vector<runtime::TaskResult> run_batch(
+        const std::vector<runtime::TaskRequest> & requests) override;
 
 private:
     struct ReferenceCacheEntry {
@@ -73,6 +76,7 @@ private:
     std::shared_ptr<HiggsCodecRuntime> codec_;
     std::unique_ptr<HiggsGenerator> generator_;
     runtime::CacheSlots<ReferenceCacheKey, ReferenceCacheEntry, ReferenceCacheKeyEqual> reference_cache_;
+    int64_t max_batch_size_ = 1;
     std::optional<ReferenceCacheEntry> uncached_reference_;
 };
 
