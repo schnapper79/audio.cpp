@@ -116,12 +116,13 @@ audiocpp_cli --task tts --family qwen3_tts --model models/Qwen3-TTS-12Hz-1.7B-Cu
 | Session option | Values | Default | Meaning |
 |---|---|---:|---|
 | `qwen3_tts.max_batch` | 1 to 8 | `1` | Requests decoded together. `1` keeps the single-sequence path. Values above 8 are clamped on CUDA with a logged warning: ggml's vector-matmul kernels cover a batch of at most 8, past that the fallback path is far slower than not batching. |
+| `qwen3_tts.speaker_embedding_cache_slots` | integer | `1024` | Cloned-voice embeddings cached by reference-audio hash (~8 KB each). A previously seen clip skips the CPU-side speaker encoder entirely, in single and batched runs alike. `0` disables caching. |
 
 Notes:
 
 - Batching raises **throughput, not per-request latency**. A single request is not faster.
 - Chunks are sorted by length internally; slots run in lockstep until the longest one finishes, so requests of similar length waste the least work.
-- A cloned voice (`--voice-ref`) runs the speaker encoder once per request; chunks reuse the embedding. Requests with different speakers, cloned voices, and instructions can share one batch.
+- A cloned voice (`--voice-ref`) resolves through the speaker-embedding cache: the encoder runs once per distinct reference clip, and every later request or chunk with the same clip reuses the vector. Requests with different speakers, cloned voices, and instructions can share one batch.
 - VRAM grows with one talker KV cache per slot. The cache starts small and doubles on demand, so short requests do not pay for a large `--max-tokens`.
 - Batched matmuls reduce in a different order than the single-sequence path, so sampled output for a given seed is close to but not bit-identical with `max_batch=1`.
 - A request that reaches `--max-tokens` is truncated exactly like in the single path; a request whose prompt cannot be built fails alone without affecting its batch neighbours.

@@ -55,11 +55,30 @@ private:
         Qwen3VoiceClonePrompt prompt;
     };
 
+    // Cloned-voice speaker embeddings, keyed by reference-audio identity. An
+    // entry is hidden_size floats (~8 KB), so a four-digit slot count costs a
+    // few megabytes and lets a server keep every voice it has ever seen warm.
+    struct SpeakerEmbeddingCacheKey {
+        int sample_rate = 0;
+        int channels = 0;
+        uint64_t sample_count = 0;
+        uint64_t sample_hash = 0;
+    };
+
+    struct SpeakerEmbeddingCacheKeyEqual {
+        bool operator()(const SpeakerEmbeddingCacheKey & lhs, const SpeakerEmbeddingCacheKey & rhs) const noexcept;
+    };
+
+    struct SpeakerEmbeddingCacheEntry {
+        Qwen3SpeakerEmbedding embedding;
+    };
+
     Qwen3TTSRequest make_request(const runtime::TaskRequest & request) const;
     const Qwen3VoiceClonePrompt & resolve_voice_prompt(
         const Qwen3VoiceCloneInput & input,
         const Qwen3TTSVoiceClonePromptBuilder & prompt_builder);
     void write_speaker_embedding(const std::string & path, const Qwen3SpeakerEmbedding & embedding) const;
+    Qwen3SpeakerEmbedding resolve_custom_voice_embedding(const runtime::AudioBuffer & reference_audio);
     void validate_batch_item(const Qwen3TalkerPrefill & prefill, const Qwen3TTSGenerationOptions & options) const;
     std::vector<Qwen3TalkerBatchItem> build_batch_items(const runtime::TaskRequest & request);
     runtime::AudioBuffer decode_batch_codes(const Qwen3TalkerBatchItem & item, const Qwen3TalkerCodes & codes);
@@ -93,6 +112,8 @@ private:
     std::unique_ptr<Qwen3SpeakerEncoderRuntime> speaker_encoder_;
     runtime::CacheSlots<VoicePromptCacheKey, VoicePromptCacheEntry, VoicePromptCacheKeyEqual> voice_prompt_cache_;
     std::optional<VoicePromptCacheEntry> uncached_voice_prompt_;
+    runtime::CacheSlots<SpeakerEmbeddingCacheKey, SpeakerEmbeddingCacheEntry, SpeakerEmbeddingCacheKeyEqual>
+        speaker_embedding_cache_;
 };
 
 }  // namespace engine::models::qwen3_tts

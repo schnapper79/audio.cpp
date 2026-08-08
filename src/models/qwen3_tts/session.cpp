@@ -177,6 +177,22 @@ std::size_t voice_prompt_cache_slots_from_options(const runtime::SessionOptions 
     return static_cast<std::size_t>(slots);
 }
 
+std::size_t speaker_embedding_cache_slots_from_options(const runtime::SessionOptions & options) {
+    // An entry is one hidden_size embedding (~8 KB), so a generous default is
+    // nearly free and spares the CPU-side speaker encoder pass (~hundreds of
+    // milliseconds) for every reference clip the session has already seen.
+    constexpr int64_t kDefaultCacheSlots = 1024;
+    const int64_t slots = runtime::parse_i64_option(options.options, {"qwen3_tts.speaker_embedding_cache_slots"})
+        .value_or(kDefaultCacheSlots);
+    if (slots < 0) {
+        throw std::runtime_error("qwen3_tts.speaker_embedding_cache_slots must be non-negative");
+    }
+    if (static_cast<std::uint64_t>(slots) > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error("qwen3_tts.speaker_embedding_cache_slots is too large");
+    }
+    return static_cast<std::size_t>(slots);
+}
+
 void validate_talker_weight_storage(engine::assets::TensorStorageType storage_type) {
     if (storage_type == engine::assets::TensorStorageType::Native ||
         storage_type == engine::assets::TensorStorageType::F32 ||
@@ -221,6 +237,15 @@ bool Qwen3TTSSession::VoicePromptCacheKeyEqual::operator()(
         lhs.sample_hash == rhs.sample_hash;
 }
 
+bool Qwen3TTSSession::SpeakerEmbeddingCacheKeyEqual::operator()(
+    const SpeakerEmbeddingCacheKey & lhs,
+    const SpeakerEmbeddingCacheKey & rhs) const noexcept {
+    return lhs.sample_rate == rhs.sample_rate &&
+        lhs.channels == rhs.channels &&
+        lhs.sample_count == rhs.sample_count &&
+        lhs.sample_hash == rhs.sample_hash;
+}
+
 Qwen3TTSSession::Qwen3TTSSession(
     runtime::TaskSpec task,
     runtime::SessionOptions options,
@@ -233,7 +258,8 @@ Qwen3TTSSession::Qwen3TTSSession(
       text_tokenizer_(assets_),
       talker_(assets_->config.talker),
       voice_prompt_context_(voice_prompt_backend_config(options)),
-      voice_prompt_cache_(voice_prompt_cache_slots_from_options(options)) {
+      voice_prompt_cache_(voice_prompt_cache_slots_from_options(options)),
+      speaker_embedding_cache_(speaker_embedding_cache_slots_from_options(options)) {
     talker_graph_arena_bytes_ = runtime::parse_size_mb_option(
         options.options, {"qwen3_tts.talker_graph_arena_mb"}, talker_graph_arena_bytes_);
     speech_encoder_graph_arena_bytes_ = runtime::parse_size_mb_option(
@@ -292,6 +318,7 @@ Qwen3TTSSession::Qwen3TTSSession(
             key != "qwen3_tts.speech_encoder_weight_type" &&
             key != "qwen3_tts.speech_decoder_weight_type" &&
             key != "qwen3_tts.voice_prompt_cache_slots" &&
+            key != "qwen3_tts.speaker_embedding_cache_slots" &&
             key != "qwen3_tts.perf_mode" &&
             key != "qwen3_tts.mem_saver") {
             throw std::runtime_error("unknown Qwen3 TTS session option: " + key);
@@ -456,10 +483,24 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         double talker_ms = 0.0;
         double decoder_ms = 0.0;
         runtime::AudioBuffer merged_audio;
+        // A cloned voice resolves through the embedding cache once per
+        // request; every chunk reuses the vector instead of re-running the
+        // CPU-side speaker encoder.
+        std::optional<Qwen3SpeakerEmbedding> cloned_embedding;
+        {
+            const Qwen3TTSRequest first_request = make_request(chunk_requests.front());
+            if (first_request.custom_voice.has_value() &&
+                first_request.custom_voice->reference_audio.has_value() &&
+                speaker_encoder_ != nullptr) {
+                cloned_embedding = resolve_custom_voice_embedding(*first_request.custom_voice->reference_audio);
+            }
+        }
         for (const auto & chunk_request : chunk_requests) {
             const Qwen3TTSRequest qwen_request = make_request(chunk_request);
             const auto prefill_start = Clock::now();
-            const auto prefill = prompt_builder.build_prefill(qwen_request);
+            const auto prefill = prompt_builder.build_prefill(
+                qwen_request,
+                cloned_embedding.has_value() ? &*cloned_embedding : nullptr);
             prefill_ms += engine::debug::elapsed_ms(prefill_start, Clock::now());
             // Sprecher-Embedding auf Wunsch herausschreiben - dasselbe Ventil
             // wie im Base-Klonpfad, damit ein CustomVoice-Setup ohne geladenes
@@ -729,6 +770,45 @@ void Qwen3TTSSession::write_speaker_embedding(
     std::fclose(out);
 }
 
+// Returns the cloned-voice embedding for a reference clip, encoding it at most
+// once per distinct clip. The encoder runs on the CPU and costs hundreds of
+// milliseconds, so on a server that keeps reusing the same voices this cache
+// turns the dominant per-request cost into a hash lookup. Returned by value:
+// an embedding is ~8 KB, and a copy dodges every eviction-lifetime question.
+Qwen3SpeakerEmbedding Qwen3TTSSession::resolve_custom_voice_embedding(
+    const runtime::AudioBuffer & reference_audio) {
+    if (speaker_encoder_ == nullptr) {
+        throw std::runtime_error(
+            "Qwen3 custom voice reference audio needs speaker encoder weights - "
+            "this checkpoint has none");
+    }
+    SpeakerEmbeddingCacheKey key;
+    key.sample_rate = reference_audio.sample_rate;
+    key.channels = reference_audio.channels;
+    key.sample_count = static_cast<uint64_t>(reference_audio.samples.size());
+    key.sample_hash = hash_audio_samples(reference_audio);
+    if (const auto * cached = speaker_embedding_cache_.find(key)) {
+        debug::trace_log_scalar("qwen3_tts.speaker_embedding_cache.hit", 1);
+        debug::trace_log_scalar(
+            "qwen3_tts.speaker_embedding_cache.entries",
+            static_cast<int64_t>(speaker_embedding_cache_.size()));
+        return cached->embedding;
+    }
+    debug::trace_log_scalar("qwen3_tts.speaker_embedding_cache.hit", 0);
+    const auto encode_start = Clock::now();
+    SpeakerEmbeddingCacheEntry entry;
+    entry.embedding = speaker_encoder_->encode(reference_audio);
+    debug::timing_log_scalar(
+        "qwen3_tts.speaker_embedding_encode_ms",
+        engine::debug::elapsed_ms(encode_start, Clock::now()));
+    auto embedding = entry.embedding;
+    speaker_embedding_cache_.put(std::move(key), std::move(entry));
+    debug::trace_log_scalar(
+        "qwen3_tts.speaker_embedding_cache.entries",
+        static_cast<int64_t>(speaker_embedding_cache_.size()));
+    return embedding;
+}
+
 // Mirrors the per-item validation that build_prompt_state and generate_batch
 // perform later, so a bad speaker, language, or token budget fails its own
 // request during item building instead of throwing out of the shared batched
@@ -789,18 +869,24 @@ std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runti
             speaker_encoder_.get(),
             assets_->config.talker.max_position_embeddings,
             assets_->config.talker.max_position_embeddings);
-        // A cloned voice runs the speaker encoder once per request; every chunk
-        // reuses the embedding of the first.
+        // A cloned voice resolves through the embedding cache once per
+        // request; every chunk reuses the vector, and a voice the session has
+        // seen before skips the speaker encoder entirely.
         std::optional<Qwen3SpeakerEmbedding> cloned_embedding;
+        {
+            const Qwen3TTSRequest first_request = make_request(chunk_requests.front());
+            if (first_request.custom_voice.has_value() &&
+                first_request.custom_voice->reference_audio.has_value() &&
+                speaker_encoder_ != nullptr) {
+                cloned_embedding = resolve_custom_voice_embedding(*first_request.custom_voice->reference_audio);
+            }
+        }
         for (const auto & chunk_request : chunk_requests) {
             const Qwen3TTSRequest qwen_request = make_request(chunk_request);
             Qwen3TalkerBatchItem item;
             item.prefill = prompt_builder.build_prefill(
                 qwen_request,
                 cloned_embedding.has_value() ? &*cloned_embedding : nullptr);
-            if (!cloned_embedding.has_value() && item.prefill.speaker_embedding.has_value()) {
-                cloned_embedding = *item.prefill.speaker_embedding;
-            }
             if (items.empty() && embedding_out_path.has_value()) {
                 if (!item.prefill.speaker_embedding.has_value()) {
                     throw std::runtime_error(
