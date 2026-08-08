@@ -29,7 +29,9 @@ Qwen3TTSCustomVoicePromptBuilder::Qwen3TTSCustomVoicePromptBuilder(
       text_token_limit_(text_token_limit),
       instruction_token_limit_(instruction_token_limit) {}
 
-Qwen3TalkerPrefill Qwen3TTSCustomVoicePromptBuilder::build_prefill(const Qwen3TTSRequest & request) const {
+Qwen3TalkerPrefill Qwen3TTSCustomVoicePromptBuilder::build_prefill(
+    const Qwen3TTSRequest & request,
+    const Qwen3SpeakerEmbedding * precomputed_speaker_embedding) const {
     if (!request.custom_voice.has_value()) {
         throw std::runtime_error("Qwen3 custom voice prefill requires custom voice input");
     }
@@ -38,7 +40,7 @@ Qwen3TalkerPrefill Qwen3TTSCustomVoicePromptBuilder::build_prefill(const Qwen3TT
         throw std::runtime_error(
             "Qwen3 custom voice prefill requires speaker or reference audio");
     }
-    if (cloned && speaker_encoder_ == nullptr) {
+    if (cloned && precomputed_speaker_embedding == nullptr && speaker_encoder_ == nullptr) {
         throw std::runtime_error(
             "Qwen3 custom voice reference audio needs speaker encoder weights - "
             "this checkpoint has none");
@@ -52,7 +54,9 @@ Qwen3TalkerPrefill Qwen3TTSCustomVoicePromptBuilder::build_prefill(const Qwen3TT
         require_token_limit(prefill.instruct_ids.size(), instruction_token_limit_, "instruction");
     }
     if (cloned) {
-        prefill.speaker_embedding = speaker_encoder_->encode(*request.custom_voice->reference_audio);
+        prefill.speaker_embedding = precomputed_speaker_embedding != nullptr
+            ? *precomputed_speaker_embedding
+            : speaker_encoder_->encode(*request.custom_voice->reference_audio);
     }
     prefill.speaker = request.custom_voice->speaker;
     prefill.language = request.language;

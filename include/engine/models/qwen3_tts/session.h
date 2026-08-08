@@ -15,12 +15,13 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace engine::models::qwen3_tts {
 
 class Qwen3TTSSession final
     : public runtime::RuntimeSessionBase
-    , public runtime::IOfflineVoiceTaskSession {
+    , public runtime::IBatchedOfflineVoiceTaskSession {
 public:
     Qwen3TTSSession(
         runtime::TaskSpec task,
@@ -32,6 +33,9 @@ public:
     runtime::RunMode run_mode() const override;
     void prepare(const runtime::SessionPreparationRequest & request) override;
     runtime::TaskResult run(const runtime::TaskRequest & request) override;
+    int64_t max_batch_size() const override;
+    std::vector<runtime::BatchedTaskResult> run_batch(
+        const std::vector<runtime::TaskRequest> & requests) override;
 
 private:
     struct VoicePromptCacheKey {
@@ -55,8 +59,13 @@ private:
     const Qwen3VoiceClonePrompt & resolve_voice_prompt(
         const Qwen3VoiceCloneInput & input,
         const Qwen3TTSVoiceClonePromptBuilder & prompt_builder);
+    void write_speaker_embedding(const std::string & path, const Qwen3SpeakerEmbedding & embedding) const;
+    void validate_batch_item(const Qwen3TalkerPrefill & prefill, const Qwen3TTSGenerationOptions & options) const;
+    std::vector<Qwen3TalkerBatchItem> build_batch_items(const runtime::TaskRequest & request);
+    runtime::AudioBuffer decode_batch_codes(const Qwen3TalkerBatchItem & item, const Qwen3TalkerCodes & codes);
 
     runtime::TaskSpec task_;
+    int64_t max_batch_size_ = 1;
     std::shared_ptr<const Qwen3TTSAssets> assets_;
     size_t talker_graph_arena_bytes_ = 256ull * 1024ull * 1024ull;
     size_t speech_encoder_graph_arena_bytes_ = 32ull * 1024ull * 1024ull;

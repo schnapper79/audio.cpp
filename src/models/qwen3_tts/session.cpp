@@ -1,12 +1,14 @@
 #include "engine/models/qwen3_tts/session.h"
 
 #include "engine/framework/debug/profiler.h"
+#include "engine/framework/debug/trace.h"
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/text/chunking.h"
 #include "engine/models/qwen3_tts/prompt_tts_custom_voice.h"
 #include "engine/models/qwen3_tts/prompt_tts_voice_design.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +21,14 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr int64_t kDefaultTextChunkSize = 8192;
+constexpr int64_t kDefaultMaxBatchSize = 1;
+
+// ggml's CUDA vector-matmul kernels cover a batch of at most 8 -- see
+// MMVQ_MAX_BATCH_SIZE in ggml-cuda/mmvq.cuh and MMVF_MAX_BATCH_SIZE in
+// mmvf.cuh. Past that the backend switches to the tiled path built for
+// prefill-sized batches, which for one token per sequence means
+// re-materializing the weights every step; going above 8 is never faster.
+constexpr int64_t kMaxCudaBatchSize = 8;
 
 std::shared_ptr<const Qwen3TTSAssets> require_assets(std::shared_ptr<const Qwen3TTSAssets> assets) {
     if (assets == nullptr) {
@@ -80,6 +90,13 @@ Qwen3TTSGenerationOptions generation_options_from_request(
     return options;
 }
 
+std::string ascii_lower(std::string value) {
+    for (char & ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
 uint64_t fnv1a_mix(uint64_t hash, const void * data, size_t size) {
     const auto * bytes = static_cast<const uint8_t *>(data);
     for (size_t i = 0; i < size; ++i) {
@@ -134,6 +151,17 @@ bool source_contains_q8_tensor(const assets::TensorSource & source) {
         }
     }
     return false;
+}
+
+int64_t resolve_max_batch_size(const runtime::SessionOptions & options) {
+    const int64_t size = runtime::parse_i64_option(
+        options.options,
+        {"qwen3_tts.max_batch", "max_batch"})
+        .value_or(kDefaultMaxBatchSize);
+    if (size < 1) {
+        throw std::runtime_error("qwen3_tts.max_batch must be at least 1");
+    }
+    return size;
 }
 
 std::size_t voice_prompt_cache_slots_from_options(const runtime::SessionOptions & options) {
@@ -247,8 +275,10 @@ Qwen3TTSSession::Qwen3TTSSession(
          !source_contains_q8_tensor(*assets_->speech_tokenizer_weights))) {
         throw std::runtime_error("qwen3_tts.perf_mode=flash_attention is supported only with Q8_0 GGUF weights");
     }
+    max_batch_size_ = resolve_max_batch_size(options);
     for (const auto & [key, _] : options.options) {
         if (key.rfind("qwen3_tts.", 0) == 0 &&
+            key != "qwen3_tts.max_batch" &&
             key != "qwen3_tts.talker_graph_arena_mb" &&
             key != "qwen3_tts.speech_encoder_graph_arena_mb" &&
             key != "qwen3_tts.speech_decoder_graph_arena_mb" &&
@@ -281,6 +311,18 @@ Qwen3TTSSession::Qwen3TTSSession(
         talker_weights_,
         assets_->config.talker.max_position_embeddings,
         assets_->config.max_new_tokens);
+    // Clamp against the resolved backend, not the requested one: a session
+    // created with BestAvailable may still land on CUDA.
+    if (talker_step_->backend_type() == core::BackendType::Cuda && max_batch_size_ > kMaxCudaBatchSize) {
+        debug::log_message(
+            debug::LogLevel::Warning,
+            "qwen3_tts",
+            "qwen3_tts.max_batch=" + std::to_string(max_batch_size_) +
+                " exceeds the CUDA vector-matmul batch limit of " +
+                std::to_string(kMaxCudaBatchSize) +
+                "; clamping, because larger batches fall back to a much slower kernel path");
+        max_batch_size_ = kMaxCudaBatchSize;
+    }
     speech_decoder_ = std::make_unique<Qwen3SpeechTokenizerDecoderRuntime>(
         assets_,
         execution_context(),
@@ -429,13 +471,7 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
                     throw std::runtime_error(
                         "speaker_embedding_out requires reference audio (voice_ref)");
                 }
-                std::FILE * emb_out = std::fopen(path->c_str(), "wb");
-                if (emb_out == nullptr) {
-                    throw std::runtime_error("cannot write speaker_embedding_out: " + *path);
-                }
-                const auto & emb_values = prefill.speaker_embedding->values;
-                std::fwrite(emb_values.data(), sizeof(float), emb_values.size(), emb_out);
-                std::fclose(emb_out);
+                write_speaker_embedding(*path, *prefill.speaker_embedding);
             }
             const auto talker_start = Clock::now();
             const auto codes = talker_step_->generate(
@@ -485,13 +521,7 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         if (const auto path = runtime::find_option(
                 chunk_request.options,
                 {"speaker_embedding_out"})) {
-            std::FILE * out = std::fopen(path->c_str(), "wb");
-            if (out == nullptr) {
-                throw std::runtime_error("cannot write speaker_embedding_out: " + *path);
-            }
-            const auto & values = voice_prompt.speaker_embedding.values;
-            std::fwrite(values.data(), sizeof(float), values.size(), out);
-            std::fclose(out);
+            write_speaker_embedding(*path, voice_prompt.speaker_embedding);
         }
         prompt_ms += engine::debug::elapsed_ms(prompt_start, Clock::now());
         const auto prefill_start = Clock::now();
@@ -523,6 +553,313 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
     debug::timing_log_scalar("qwen3_tts.speech_decoder_ms", decoder_ms);
     debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
     return result;
+}
+
+int64_t Qwen3TTSSession::max_batch_size() const {
+    return max_batch_size_;
+}
+
+std::vector<runtime::BatchedTaskResult> Qwen3TTSSession::run_batch(
+    const std::vector<runtime::TaskRequest> & requests) {
+    require_prepared("Qwen3 TTS run_batch");
+    if (requests.empty()) {
+        throw std::runtime_error("Qwen3 TTS run_batch requires at least one request");
+    }
+    if (max_batch_size_ <= 1) {
+        // Batching disabled. Run each request on its own and translate a throw
+        // into the same per-request error the batched path reports, so callers
+        // only handle one shape of failure. A single request stays on the
+        // batched path below: its text chunks are independent generations and
+        // batch against each other.
+        std::vector<runtime::BatchedTaskResult> out;
+        out.reserve(requests.size());
+        for (const auto & request : requests) {
+            runtime::BatchedTaskResult entry;
+            try {
+                entry.result = run(request);
+            } catch (const std::exception & ex) {
+                entry.error = ex.what();
+            }
+            out.push_back(std::move(entry));
+        }
+        return out;
+    }
+
+    const auto wall_start = Clock::now();
+
+    // Long text is chunked before generation, so the unit of batching is a
+    // chunk, not a request. Chunks of one request are independent generations
+    // and only have to be concatenated in order afterwards.
+    struct ChunkItem {
+        size_t request_index = 0;
+        size_t chunk_index = 0;
+        size_t text_length = 0;
+        Qwen3TalkerBatchItem item;
+    };
+    std::vector<ChunkItem> items;
+    std::vector<size_t> chunk_counts(requests.size(), 0);
+    // A request whose prompt cannot be built (bad speaker, token limit, missing
+    // reference) fails alone; its neighbours still run.
+    std::vector<std::string> request_errors(requests.size());
+    for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
+        try {
+            auto batch_items = build_batch_items(requests[request_index]);
+            chunk_counts[request_index] = batch_items.size();
+            for (size_t chunk_index = 0; chunk_index < batch_items.size(); ++chunk_index) {
+                ChunkItem item;
+                item.request_index = request_index;
+                item.chunk_index = chunk_index;
+                item.text_length = batch_items[chunk_index].prefill.input_ids.size();
+                item.item = std::move(batch_items[chunk_index]);
+                items.push_back(std::move(item));
+            }
+        } catch (const std::exception & ex) {
+            request_errors[request_index] = ex.what();
+        }
+    }
+
+    // Slots run in lockstep until the longest one finishes, so batching
+    // similar lengths together is what keeps the padding cheap. Prompts do not
+    // share state across slots, so length is the only sort key.
+    std::vector<size_t> order(items.size());
+    for (size_t index = 0; index < order.size(); ++index) {
+        order[index] = index;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+        return items[lhs].text_length < items[rhs].text_length;
+    });
+
+    debug::trace_log_scalar("qwen3_tts.run_batch.requests", static_cast<int64_t>(requests.size()));
+    debug::trace_log_scalar("qwen3_tts.run_batch.chunks", static_cast<int64_t>(items.size()));
+    debug::trace_log_scalar("qwen3_tts.run_batch.max_batch", max_batch_size_);
+
+    std::vector<std::vector<runtime::AudioBuffer>> chunk_audio(requests.size());
+    for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
+        chunk_audio[request_index].resize(chunk_counts[request_index]);
+    }
+
+    // Split into equally sized batches rather than filling each to the limit.
+    // A trailing remainder batch is the expensive case: cost per step grows far
+    // more slowly than the batch, so 5+5 beats 8+2 for ten chunks.
+    if (!order.empty()) {
+        const size_t batch_limit = static_cast<size_t>(max_batch_size_);
+        const size_t batch_count = (order.size() + batch_limit - 1) / batch_limit;
+        const size_t base_size = order.size() / batch_count;
+        const size_t remainder = order.size() % batch_count;
+        for (size_t index = 0, batch_index = 0; index < order.size(); ++batch_index) {
+            const size_t start = index;
+            const size_t end = start + base_size + (batch_index < remainder ? 1 : 0);
+            index = end;
+            std::vector<Qwen3TalkerBatchItem> batch;
+            batch.reserve(end - start);
+            for (size_t slot = start; slot < end; ++slot) {
+                batch.push_back(items[order[slot]].item);
+            }
+            std::vector<Qwen3TalkerCodes> batch_codes;
+            try {
+                batch_codes = talker_step_->generate_batch(batch);
+            } catch (const std::exception & ex) {
+                // Backstop for per-item validation that only the talker can do
+                // (assembled prompt over capacity, say). The failure is
+                // attributed to every request in this sub-batch, but other
+                // sub-batches keep their results.
+                for (size_t slot = start; slot < end; ++slot) {
+                    auto & error_slot = request_errors[items[order[slot]].request_index];
+                    if (error_slot.empty()) {
+                        error_slot = ex.what();
+                    }
+                }
+                continue;
+            }
+            if (batch_codes.size() != batch.size()) {
+                throw std::runtime_error("Qwen3 TTS batch generation returned the wrong result count");
+            }
+            for (size_t slot = start; slot < end; ++slot) {
+                const auto & item = items[order[slot]];
+                auto & error_slot = request_errors[item.request_index];
+                if (!error_slot.empty()) {
+                    // The request already failed on an earlier chunk; decoding
+                    // more of its audio would be thrown away at assembly.
+                    continue;
+                }
+                try {
+                    chunk_audio[item.request_index][item.chunk_index] =
+                        decode_batch_codes(item.item, batch_codes[slot - start]);
+                } catch (const std::exception & ex) {
+                    error_slot = "chunk " + std::to_string(item.chunk_index + 1) + " of " +
+                        std::to_string(chunk_counts[item.request_index]) + ": " + ex.what();
+                }
+            }
+        }
+    }
+
+    std::vector<runtime::BatchedTaskResult> out;
+    out.reserve(requests.size());
+    for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
+        runtime::BatchedTaskResult entry;
+        if (!request_errors[request_index].empty()) {
+            entry.error = std::move(request_errors[request_index]);
+            out.push_back(std::move(entry));
+            continue;
+        }
+        runtime::AudioBuffer merged;
+        for (auto & chunk : chunk_audio[request_index]) {
+            runtime::append_audio_buffer(merged, std::move(chunk));
+        }
+        entry.result.audio_output = std::move(merged);
+        out.push_back(std::move(entry));
+    }
+    if (mem_saver_) {
+        // A size-1 sub-batch delegates to the single-sequence path, which
+        // retains its cached step graph; honor mem_saver here like run() does.
+        talker_step_->release_cached_step_graph();
+    }
+    debug::timing_log_scalar("session.batch_wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
+    return out;
+}
+
+void Qwen3TTSSession::write_speaker_embedding(
+    const std::string & path,
+    const Qwen3SpeakerEmbedding & embedding) const {
+    std::FILE * out = std::fopen(path.c_str(), "wb");
+    if (out == nullptr) {
+        throw std::runtime_error("cannot write speaker_embedding_out: " + path);
+    }
+    std::fwrite(embedding.values.data(), sizeof(float), embedding.values.size(), out);
+    std::fclose(out);
+}
+
+// Mirrors the per-item validation that build_prompt_state and generate_batch
+// perform later, so a bad speaker, language, or token budget fails its own
+// request during item building instead of throwing out of the shared batched
+// generation and taking its batch neighbours down with it.
+void Qwen3TTSSession::validate_batch_item(
+    const Qwen3TalkerPrefill & prefill,
+    const Qwen3TTSGenerationOptions & options) const {
+    const auto & config = assets_->config.talker;
+    if (options.max_new_tokens > assets_->config.max_new_tokens) {
+        throw std::runtime_error("Qwen3 TTS max_tokens exceeds the model generation capacity");
+    }
+    std::string language = ascii_lower(prefill.language);
+    if (prefill.prompt_mode == Qwen3TalkerPromptMode::CustomVoice && !prefill.speaker_embedding.has_value()) {
+        const std::string speaker = ascii_lower(prefill.speaker);
+        const auto speaker_it = config.speaker_id.find(speaker);
+        if (speaker_it == config.speaker_id.end()) {
+            throw std::runtime_error("Qwen3 custom voice unsupported speaker: " + prefill.speaker);
+        }
+        const auto dialect_it = config.speaker_dialect.find(speaker);
+        if (dialect_it == config.speaker_dialect.end()) {
+            throw std::runtime_error("Qwen3 custom voice missing dialect entry for speaker: " + prefill.speaker);
+        }
+        if ((language == "chinese" || language == "auto") && dialect_it->second.has_value()) {
+            language = *dialect_it->second;
+        }
+    }
+    if (language != "auto" && config.codec_language_id.find(language) == config.codec_language_id.end()) {
+        throw std::runtime_error("Qwen3 talker unsupported language: " + prefill.language);
+    }
+}
+
+std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runtime::TaskRequest & request) {
+    const int64_t text_chunk_size =
+        engine::text::parse_text_chunk_size_override(request.options).value_or(kDefaultTextChunkSize);
+    const auto chunk_requests = runtime::chunk_text_request(request, text_chunk_size);
+    const auto embedding_out_path = runtime::find_option(request.options, {"speaker_embedding_out"});
+    std::vector<Qwen3TalkerBatchItem> items;
+    items.reserve(chunk_requests.size());
+    if (assets_->config.variant == Qwen3TTSVariant::VoiceDesign) {
+        Qwen3TTSVoiceDesignPromptBuilder prompt_builder(
+            text_tokenizer_,
+            assets_->config.talker.max_position_embeddings,
+            assets_->config.talker.max_position_embeddings);
+        for (const auto & chunk_request : chunk_requests) {
+            const Qwen3TTSRequest qwen_request = make_request(chunk_request);
+            Qwen3TalkerBatchItem item;
+            item.prefill = prompt_builder.build_prefill(qwen_request);
+            item.options = qwen_request.generation;
+            item.repetition_penalty = qwen_request.generation.repetition_penalty;
+            validate_batch_item(item.prefill, item.options);
+            items.push_back(std::move(item));
+        }
+        return items;
+    }
+    if (assets_->config.variant == Qwen3TTSVariant::CustomVoice) {
+        Qwen3TTSCustomVoicePromptBuilder prompt_builder(
+            text_tokenizer_,
+            speaker_encoder_.get(),
+            assets_->config.talker.max_position_embeddings,
+            assets_->config.talker.max_position_embeddings);
+        // A cloned voice runs the speaker encoder once per request; every chunk
+        // reuses the embedding of the first.
+        std::optional<Qwen3SpeakerEmbedding> cloned_embedding;
+        for (const auto & chunk_request : chunk_requests) {
+            const Qwen3TTSRequest qwen_request = make_request(chunk_request);
+            Qwen3TalkerBatchItem item;
+            item.prefill = prompt_builder.build_prefill(
+                qwen_request,
+                cloned_embedding.has_value() ? &*cloned_embedding : nullptr);
+            if (!cloned_embedding.has_value() && item.prefill.speaker_embedding.has_value()) {
+                cloned_embedding = *item.prefill.speaker_embedding;
+            }
+            if (items.empty() && embedding_out_path.has_value()) {
+                if (!item.prefill.speaker_embedding.has_value()) {
+                    throw std::runtime_error(
+                        "speaker_embedding_out requires reference audio (voice_ref)");
+                }
+                write_speaker_embedding(*embedding_out_path, *item.prefill.speaker_embedding);
+            }
+            item.options = qwen_request.generation;
+            item.repetition_penalty = qwen_request.generation.repetition_penalty;
+            validate_batch_item(item.prefill, item.options);
+            items.push_back(std::move(item));
+        }
+        return items;
+    }
+    const Qwen3TTSRequest first_request = make_request(chunk_requests.front());
+    if (!first_request.voice_clone.has_value()) {
+        throw std::runtime_error("Qwen3 base TTS requires voice clone reference audio");
+    }
+    if (speech_encoder_ == nullptr || speaker_encoder_ == nullptr) {
+        throw std::runtime_error("Qwen3 base TTS session is missing voice clone runtimes");
+    }
+    Qwen3TTSVoiceClonePromptBuilder prompt_builder(
+        text_tokenizer_,
+        *speech_encoder_,
+        *speaker_encoder_,
+        assets_->config.talker.max_position_embeddings);
+    // Resolved once per request and consumed before the next request resolves;
+    // the returned reference points into a slot cache a later resolve may evict.
+    const auto & voice_prompt = resolve_voice_prompt(*first_request.voice_clone, prompt_builder);
+    if (embedding_out_path.has_value()) {
+        write_speaker_embedding(*embedding_out_path, voice_prompt.speaker_embedding);
+    }
+    if (!voice_prompt.reference_codes.has_value()) {
+        throw std::runtime_error("Qwen3 base TTS talker currently requires ICL reference codes");
+    }
+    for (const auto & chunk_request : chunk_requests) {
+        const Qwen3TTSRequest qwen_request = make_request(chunk_request);
+        Qwen3TalkerBatchItem item;
+        item.prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
+        item.options = qwen_request.generation;
+        item.repetition_penalty = qwen_request.generation.repetition_penalty;
+        validate_batch_item(item.prefill, item.options);
+        items.push_back(std::move(item));
+    }
+    return items;
+}
+
+runtime::AudioBuffer Qwen3TTSSession::decode_batch_codes(
+    const Qwen3TalkerBatchItem & item,
+    const Qwen3TalkerCodes & codes) {
+    if (assets_->config.variant == Qwen3TTSVariant::Base) {
+        if (!item.prefill.reference_codes.has_value()) {
+            throw std::runtime_error("Qwen3 base TTS batch decode requires reference codes");
+        }
+        return speech_decoder_->decode_and_trim_reference(
+            *item.prefill.reference_codes,
+            codes.generated_codes);
+    }
+    return speech_decoder_->decode(codes.generated_codes);
 }
 
 const Qwen3VoiceClonePrompt & Qwen3TTSSession::resolve_voice_prompt(

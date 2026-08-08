@@ -37,6 +37,14 @@ struct Qwen3TalkerCodes {
     Qwen3SpeechCodes decoder_input_codes;
 };
 
+// One sequence of a batched generation run. Options are per item, so requests
+// with different sampling settings or token limits can share a batch.
+struct Qwen3TalkerBatchItem {
+    Qwen3TalkerPrefill prefill;
+    Qwen3TTSGenerationOptions options;
+    float repetition_penalty = 1.05F;
+};
+
 class Qwen3TalkerWeightsRuntime;
 class Qwen3TalkerStepRuntime;
 
@@ -50,7 +58,15 @@ public:
         const Qwen3TalkerPrefill & prefill,
         const Qwen3TTSGenerationOptions & options,
         float repetition_penalty = 1.05F);
+    // Decodes all items in one batched AR pass; results are in item order.
+    // A sequence that reaches max_new_tokens is truncated, not failed, exactly
+    // like the single path. Throws on malformed items (prompt over capacity),
+    // because no retry would help.
+    std::vector<Qwen3TalkerCodes> generate_batch(const std::vector<Qwen3TalkerBatchItem> & items);
     int64_t release_cached_step_graph();
+    // Resolved backend type; differs from the requested one when the session
+    // was created with BestAvailable.
+    core::BackendType backend_type() const;
 
 private:
     std::unique_ptr<Impl> impl_;

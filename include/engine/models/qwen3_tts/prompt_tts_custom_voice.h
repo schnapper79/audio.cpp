@@ -15,7 +15,12 @@ public:
         int64_t text_token_limit,
         int64_t instruction_token_limit);
 
-    Qwen3TalkerPrefill build_prefill(const Qwen3TTSRequest & request) const;
+    // `precomputed_speaker_embedding` skips the speaker-encoder pass for a
+    // cloned voice; the batched session uses it to encode a request's
+    // reference clip once instead of once per text chunk.
+    Qwen3TalkerPrefill build_prefill(
+        const Qwen3TTSRequest & request,
+        const Qwen3SpeakerEmbedding * precomputed_speaker_embedding = nullptr) const;
 
 private:
     const Qwen3TextTokenizer & tokenizer_;

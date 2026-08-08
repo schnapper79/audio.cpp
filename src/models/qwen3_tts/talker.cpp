@@ -167,6 +167,16 @@ struct CodePredictorTiming {
     double output_read_ms = 0.0;
 };
 
+CachedStepTiming accumulate_step_timing(const CachedStepTiming & lhs, const CachedStepTiming & rhs) {
+    CachedStepTiming out;
+    out.input_upload_ms = lhs.input_upload_ms + rhs.input_upload_ms;
+    out.mask_upload_ms = lhs.mask_upload_ms + rhs.mask_upload_ms;
+    out.graph_compute_ms = lhs.graph_compute_ms + rhs.graph_compute_ms;
+    out.output_read_ms = lhs.output_read_ms + rhs.output_read_ms;
+    out.kv_copy_ms = lhs.kv_copy_ms + rhs.kv_copy_ms;
+    return out;
+}
+
 std::string ascii_lower(std::string value) {
     for (char & ch : value) {
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
@@ -208,11 +218,17 @@ core::TensorValue cache_view(
         GGML_TYPE_F32);
 }
 
+// At batch 1 CUDA matmuls take the mul_mat_vec path, which accumulates in
+// fp32. From about four sequences the backend switches to tensor cores, and
+// with GGML_PREC_DEFAULT those accumulate in fp16 -- visible as logits
+// quantized to 1/16 steps. Batched graphs therefore pass GGML_PREC_F32 for
+// projection_precision; the single-sequence graphs keep the default.
 template <typename Config>
 modules::QwenCausalDecoderConfig make_qwen_decoder_config(
     const Config & config,
     int64_t logits_size,
-    Qwen3TTSPerfMode perf_mode) {
+    Qwen3TTSPerfMode perf_mode,
+    ggml_prec projection_precision = GGML_PREC_DEFAULT) {
     modules::QwenCausalDecoderConfig out;
     out.stack.hidden_size = config.hidden_size;
     out.stack.num_attention_heads = config.num_attention_heads;
@@ -223,6 +239,7 @@ modules::QwenCausalDecoderConfig make_qwen_decoder_config(
     out.stack.rms_norm_eps = config.rms_norm_eps;
     out.stack.rope_theta = config.rope_theta;
     out.stack.attention_precision = GGML_PREC_F32;
+    out.stack.projection_precision = projection_precision;
     out.stack.use_qk_norm = true;
     out.stack.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
     if (perf_mode == Qwen3TTSPerfMode::FlashAttention) {
@@ -231,6 +248,7 @@ modules::QwenCausalDecoderConfig make_qwen_decoder_config(
     }
     out.logits_size = logits_size;
     out.logits_mode = modules::QwenCausalDecoderLogitsMode::LastStep;
+    out.lm_head_precision = projection_precision;
     return out;
 }
 
@@ -315,7 +333,8 @@ core::TensorValue project_code_predictor_input(
     const core::TensorValue & input,
     const Qwen3TalkerWeights & weights,
     const Qwen3TTSConfig & config,
-    core::ConstantTensorCache & constants) {
+    core::ConstantTensorCache & constants,
+    ggml_prec projection_precision = GGML_PREC_DEFAULT) {
     if (config.code_predictor.hidden_size == config.talker.hidden_size) {
         return input;
     }
@@ -323,7 +342,11 @@ core::TensorValue project_code_predictor_input(
         throw std::runtime_error("Qwen3 code predictor requires small_to_mtp_projection weights");
     }
     const auto & projection = *weights.code_predictor.small_to_mtp_projection;
-    return modules::LinearModule({config.talker.hidden_size, config.code_predictor.hidden_size, projection.bias.has_value()})
+    return modules::LinearModule(
+               {config.talker.hidden_size,
+                config.code_predictor.hidden_size,
+                projection.bias.has_value(),
+                projection_precision})
         .build(ctx, input, binding::linear_data(constants, projection.weight, projection.bias));
 }
 
@@ -870,6 +893,10 @@ public:
 
     Qwen3TTSPerfMode perf_mode() const noexcept {
         return perf_mode_;
+    }
+
+    core::BackendType backend_type() const noexcept {
+        return backend_type_;
     }
 
 private:
@@ -1645,6 +1672,885 @@ private:
     CodePredictorTiming timing_;
 };
 
+// KV cache holding `slots` independent sequences for one decoder stack.
+//
+// Sequences are stored left-padded: slot `b` with a prompt of `P_b` steps
+// occupies cache steps [prompt_capacity - P_b, prompt_capacity), so every slot
+// decodes at the same cache index and therefore at the same RoPE position.
+// ggml applies one position vector across the whole batch dimension, and RoPE
+// scores depend only on position differences, so the constant shift per slot
+// leaves attention unchanged. Stored in F32 like the single-sequence cache, so
+// batched and single decodes share their numerics.
+class Qwen3BatchKVCache {
+public:
+    Qwen3BatchKVCache(
+        const Qwen3TalkerWeightsRuntime & weights,
+        const char * label,
+        int64_t layers,
+        int64_t kv_heads,
+        int64_t head_dim,
+        int64_t slots,
+        int64_t cache_steps)
+        : slots_(slots),
+          cache_steps_(cache_steps),
+          kv_heads_(kv_heads),
+          head_dim_(head_dim) {
+        if (layers <= 0 || slots_ <= 0 || cache_steps_ <= 0) {
+            throw std::runtime_error("Qwen3 talker batch KV cache requires positive dimensions");
+        }
+        ggml_init_params params{4 * 1024 * 1024, nullptr, true};
+        ctx_.reset(ggml_init(params));
+        if (ctx_ == nullptr) {
+            throw std::runtime_error("failed to initialize Qwen3 talker batch KV cache context");
+        }
+        core::ModuleBuildContext build_ctx{ctx_.get(), label};
+        keys_.reserve(static_cast<size_t>(layers));
+        values_.reserve(static_cast<size_t>(layers));
+        for (int64_t layer = 0; layer < layers; ++layer) {
+            keys_.push_back(core::make_tensor(
+                build_ctx,
+                GGML_TYPE_F32,
+                core::TensorShape::from_dims({slots_, cache_steps_, kv_heads_, head_dim_})));
+            values_.push_back(core::make_tensor(
+                build_ctx,
+                GGML_TYPE_F32,
+                core::TensorShape::from_dims({slots_, cache_steps_, kv_heads_, head_dim_})));
+        }
+        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), weights.backend());
+        if (buffer_ == nullptr) {
+            throw std::runtime_error("failed to allocate Qwen3 talker batch KV cache");
+        }
+        // Left padding and not-yet-written steps are masked out during decode,
+        // but the flash attention paths still read the whole window, so it must
+        // not hold garbage.
+        for (size_t layer = 0; layer < keys_.size(); ++layer) {
+            ggml_backend_tensor_memset(keys_[layer].tensor, 0, 0, ggml_nbytes(keys_[layer].tensor));
+            ggml_backend_tensor_memset(values_[layer].tensor, 0, 0, ggml_nbytes(values_[layer].tensor));
+        }
+    }
+
+    ~Qwen3BatchKVCache() {
+        if (buffer_ != nullptr) {
+            ggml_backend_buffer_free(buffer_);
+        }
+    }
+
+    Qwen3BatchKVCache(const Qwen3BatchKVCache &) = delete;
+    Qwen3BatchKVCache & operator=(const Qwen3BatchKVCache &) = delete;
+
+    int64_t slots() const noexcept { return slots_; }
+    int64_t cache_steps() const noexcept { return cache_steps_; }
+    int64_t kv_heads() const noexcept { return kv_heads_; }
+    int64_t head_dim() const noexcept { return head_dim_; }
+    size_t layers() const noexcept { return keys_.size(); }
+    const core::TensorValue & key_tensor(size_t layer) const { return keys_.at(layer); }
+    const core::TensorValue & value_tensor(size_t layer) const { return values_.at(layer); }
+
+private:
+    int64_t slots_ = 0;
+    int64_t cache_steps_ = 0;
+    int64_t kv_heads_ = 0;
+    int64_t head_dim_ = 0;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+    std::vector<core::TensorValue> keys_;
+    std::vector<core::TensorValue> values_;
+    ggml_backend_buffer_t buffer_ = nullptr;
+};
+
+// View of one slot's step range in a batched cache laid out as
+// {slots, cache_steps, heads, head_dim} (ggml ne = [head_dim, heads, cache_steps, slots]).
+core::TensorValue batch_cache_view(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & cache,
+    int64_t slot,
+    int64_t start,
+    int64_t steps,
+    int64_t heads,
+    int64_t head_dim) {
+    if (slot < 0 || slot >= cache.shape.dims[0]) {
+        throw std::runtime_error("Qwen3 talker batch cache view slot is out of range");
+    }
+    if (start < 0 || steps <= 0 || start + steps > cache.shape.dims[1]) {
+        throw std::runtime_error("Qwen3 talker batch cache view range is invalid");
+    }
+    return core::wrap_tensor(
+        ggml_view_4d(
+            ctx.ggml,
+            cache.tensor,
+            head_dim,
+            heads,
+            steps,
+            1,
+            cache.tensor->nb[1],
+            cache.tensor->nb[2],
+            cache.tensor->nb[3],
+            static_cast<size_t>(slot) * cache.tensor->nb[3] +
+                static_cast<size_t>(start) * cache.tensor->nb[2]),
+        core::TensorShape::from_dims({1, steps, heads, head_dim}),
+        cache.type);
+}
+
+// View of the same step range in every slot at once. The slot stride is kept
+// in nb[3], so copying a contiguous {slots, steps, heads, head_dim} tensor
+// through this view fans it out into the right rows of each slot.
+core::TensorValue batch_cache_view_all_slots(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & cache,
+    int64_t start,
+    int64_t steps,
+    int64_t heads,
+    int64_t head_dim) {
+    if (start < 0 || steps <= 0 || start + steps > cache.shape.dims[1]) {
+        throw std::runtime_error("Qwen3 talker batch cache view range is invalid");
+    }
+    return core::wrap_tensor(
+        ggml_view_4d(
+            ctx.ggml,
+            cache.tensor,
+            head_dim,
+            heads,
+            steps,
+            cache.shape.dims[0],
+            cache.tensor->nb[1],
+            cache.tensor->nb[2],
+            cache.tensor->nb[3],
+            static_cast<size_t>(start) * cache.tensor->nb[2]),
+        core::TensorShape::from_dims({cache.shape.dims[0], steps, heads, head_dim}),
+        cache.type);
+}
+
+// Copies the first `steps` cache steps of every slot from `src` into `dst` on
+// the device. Used to grow a batched cache without a host round trip.
+void copy_qwen3_batch_kv_cache(
+    const Qwen3TalkerWeightsRuntime & weights,
+    Qwen3BatchKVCache & dst,
+    const Qwen3BatchKVCache & src,
+    int64_t steps) {
+    if (dst.slots() != src.slots() || dst.layers() != src.layers()) {
+        throw std::runtime_error("Qwen3 talker batch cache copy requires matching shapes");
+    }
+    if (steps <= 0 || steps > src.cache_steps() || steps > dst.cache_steps()) {
+        throw std::runtime_error("Qwen3 talker batch cache copy range is invalid");
+    }
+    ggml_init_params params{
+        ggml_tensor_overhead() * (8 * dst.layers() + 64) + ggml_graph_overhead_custom(4096, false),
+        nullptr,
+        true};
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx(ggml_init(params));
+    if (ctx == nullptr) {
+        throw std::runtime_error("failed to initialize Qwen3 talker batch cache copy context");
+    }
+    core::ModuleBuildContext build_ctx{ctx.get(), "qwen3_tts.talker.batch_kv_cache.grow"};
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 4096, false);
+    for (size_t layer = 0; layer < src.layers(); ++layer) {
+        const auto copy_range = [&](const core::TensorValue & source, const core::TensorValue & target) {
+            auto from = batch_cache_view_all_slots(
+                build_ctx, source, 0, steps, src.kv_heads(), src.head_dim());
+            auto to = batch_cache_view_all_slots(
+                build_ctx, target, 0, steps, dst.kv_heads(), dst.head_dim());
+            ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), from.tensor, to.tensor));
+        };
+        copy_range(src.key_tensor(layer), dst.key_tensor(layer));
+        copy_range(src.value_tensor(layer), dst.value_tensor(layer));
+    }
+    core::set_backend_threads(weights.backend(), weights.threads());
+    const ggml_status status = engine::core::compute_backend_graph(weights.backend(), graph);
+    engine::core::release_backend_graph_resources(weights.backend(), graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("Qwen3 talker batch cache copy failed");
+    }
+}
+
+// Prefills one slot of a batched cache. Each slot is prefilled on its own
+// because prompt lengths differ; only the decode loop runs batched, which is
+// where the time goes. Unlike the single-sequence prefill graph this writes
+// K/V straight into the batch cache instead of round-tripping through the
+// host, and shifts the RoPE positions by the slot's left padding.
+class TalkerBatchPrefillGraph {
+public:
+    TalkerBatchPrefillGraph(
+        std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
+        Qwen3BatchKVCache & cache,
+        int64_t slot,
+        int64_t prompt_steps,
+        int64_t cache_offset)
+        : weights_(std::move(weights)),
+          prompt_steps_(prompt_steps),
+          cache_offset_(cache_offset) {
+        if (prompt_steps_ <= 0) {
+            throw std::runtime_error("Qwen3 talker batch prefill requires a positive prompt");
+        }
+        if (cache_offset_ < 0 || cache_offset_ + prompt_steps_ > cache.cache_steps()) {
+            throw std::runtime_error("Qwen3 talker batch prefill does not fit the cache");
+        }
+        ggml_init_params params{weights_->graph_arena_bytes(), nullptr, true};
+        ctx_.reset(ggml_init(params));
+        if (ctx_ == nullptr) {
+            throw std::runtime_error("failed to initialize Qwen3 talker batch prefill graph context");
+        }
+        const auto & config = weights_->assets().config.talker;
+        const auto & tensor_weights = weights_->weights();
+        core::ModuleBuildContext ctx{ctx_.get(), "qwen3_tts.talker.batch_prefill"};
+        auto x = core::make_tensor(ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, prompt_steps_, config.hidden_size}));
+        input_ = x.tensor;
+        positions_ = ggml_new_tensor_1d(ctx_.get(), GGML_TYPE_I32, prompt_steps_);
+        auto positions_value = core::wrap_tensor(positions_, core::TensorShape::from_dims({prompt_steps_}), GGML_TYPE_I32);
+        auto & constants = weights_->talker_constants();
+        constants.begin_graph();
+        std::optional<core::TensorValue> attention_mask = std::nullopt;
+        if (weights_->perf_mode() == Qwen3TTSPerfMode::FlashAttention) {
+            attention_mask_ = ggml_new_tensor_4d(ctx_.get(), GGML_TYPE_F16, prompt_steps_, prompt_steps_, 1, 1);
+            attention_mask = core::wrap_tensor(
+                attention_mask_,
+                core::TensorShape::from_dims({1, 1, prompt_steps_, prompt_steps_}),
+                GGML_TYPE_F16);
+        }
+        auto decoder_out = modules::QwenCausalDecoderModule(make_qwen_decoder_config(config, config.vocab_size, weights_->perf_mode()))
+                               .build(
+                                   ctx,
+                                   x,
+                                   positions_value,
+                                   make_qwen_decoder_weights(constants, tensor_weights.layers, tensor_weights.norm, tensor_weights.codec_head),
+                                   std::nullopt,
+                                   attention_mask);
+        graph_ = ggml_new_graph_custom(ctx_.get(), 65536, false);
+        for (size_t layer_index = 0; layer_index < decoder_out.state.layers.size(); ++layer_index) {
+            const auto & layer = decoder_out.state.layers[layer_index];
+            if (!layer.key.has_value() || !layer.value.has_value()) {
+                throw std::runtime_error("Qwen3 talker batch prefill decoder did not return K/V state");
+            }
+            auto key_dest = batch_cache_view(
+                ctx, cache.key_tensor(layer_index), slot, cache_offset_, prompt_steps_, cache.kv_heads(), cache.head_dim());
+            auto value_dest = batch_cache_view(
+                ctx, cache.value_tensor(layer_index), slot, cache_offset_, prompt_steps_, cache.kv_heads(), cache.head_dim());
+            ggml_build_forward_expand(graph_, ggml_cpy(ctx.ggml, layer.key->tensor, key_dest.tensor));
+            ggml_build_forward_expand(graph_, ggml_cpy(ctx.ggml, layer.value->tensor, value_dest.tensor));
+        }
+        hidden_output_ = decoder_out.hidden.tensor;
+        logits_output_ = decoder_out.logits.tensor;
+        ggml_set_output(logits_output_);
+        ggml_build_forward_expand(graph_, logits_output_);
+        constants.finish_graph();
+        constants.ensure_uploaded();
+        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), weights_->backend());
+        if (buffer_ == nullptr) {
+            throw std::runtime_error("failed to allocate Qwen3 talker batch prefill graph");
+        }
+        // Positions are shifted by the left padding so that every slot's last
+        // prompt token lands on position prompt_capacity - 1, which is what
+        // lets one shared position drive the batched decode graph.
+        std::vector<int32_t> positions(static_cast<size_t>(prompt_steps_), 0);
+        for (int64_t i = 0; i < prompt_steps_; ++i) {
+            positions[static_cast<size_t>(i)] = static_cast<int32_t>(cache_offset_ + i);
+        }
+        ggml_backend_tensor_set(positions_, positions.data(), 0, positions.size() * sizeof(int32_t));
+        if (attention_mask_ != nullptr) {
+            auto mask = modules::qwen_causal_prefill_mask_values(1, prompt_steps_);
+            ggml_backend_tensor_set(attention_mask_, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        }
+    }
+
+    ~TalkerBatchPrefillGraph() {
+        engine::core::release_backend_graph_resources(weights_->backend(), graph_);
+        if (buffer_ != nullptr) {
+            ggml_backend_buffer_free(buffer_);
+        }
+    }
+
+    TalkerBatchPrefillGraph(const TalkerBatchPrefillGraph &) = delete;
+    TalkerBatchPrefillGraph & operator=(const TalkerBatchPrefillGraph &) = delete;
+
+    Qwen3TalkerPrefillResult run(const std::vector<float> & embeddings) {
+        const auto & config = weights_->assets().config.talker;
+        if (static_cast<int64_t>(embeddings.size()) != prompt_steps_ * config.hidden_size) {
+            throw std::runtime_error("Qwen3 talker batch prefill embedding size mismatch");
+        }
+        ggml_backend_tensor_set(input_, embeddings.data(), 0, embeddings.size() * sizeof(float));
+        core::set_backend_threads(weights_->backend(), weights_->threads());
+        const ggml_status status = engine::core::compute_backend_graph(weights_->backend(), graph_);
+        ggml_backend_synchronize(weights_->backend());
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Qwen3 talker batch prefill graph compute failed");
+        }
+        Qwen3TalkerPrefillResult out;
+        out.logits.vocab_size = config.vocab_size;
+        out.logits.values.resize(static_cast<size_t>(config.vocab_size));
+        ggml_backend_tensor_get(logits_output_, out.logits.values.data(), 0, out.logits.values.size() * sizeof(float));
+        out.last_hidden.dims = config.hidden_size;
+        out.last_hidden.values.resize(static_cast<size_t>(config.hidden_size));
+        ggml_backend_tensor_get(hidden_output_, out.last_hidden.values.data(), 0, out.last_hidden.values.size() * sizeof(float));
+        return out;
+    }
+
+private:
+    std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights_;
+    int64_t prompt_steps_ = 0;
+    int64_t cache_offset_ = 0;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+    ggml_tensor * input_ = nullptr;
+    ggml_tensor * positions_ = nullptr;
+    ggml_tensor * attention_mask_ = nullptr;
+    ggml_tensor * hidden_output_ = nullptr;
+    ggml_tensor * logits_output_ = nullptr;
+    ggml_cgraph * graph_ = nullptr;
+    ggml_backend_buffer_t buffer_ = nullptr;
+};
+
+// Batched equivalent of TalkerCachedStepGraph: one forward pass advances every
+// slot by one frame. The batch dimension lives in ggml ne[3]; the token axis
+// stays at 1 per slot, which keeps the CUDA vector-matmul kernels in play.
+class TalkerBatchStepGraph {
+public:
+    TalkerBatchStepGraph(
+        std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
+        Qwen3BatchKVCache & cache)
+        : weights_(std::move(weights)),
+          slots_(cache.slots()),
+          cache_steps_(cache.cache_steps()) {
+        ggml_init_params params{weights_->graph_arena_bytes(), nullptr, true};
+        ctx_.reset(ggml_init(params));
+        if (ctx_ == nullptr) {
+            throw std::runtime_error("failed to initialize Qwen3 talker batch step graph context");
+        }
+        const auto & config = weights_->assets().config.talker;
+        const auto & tensor_weights = weights_->weights();
+        core::ModuleBuildContext ctx{ctx_.get(), "qwen3_tts.talker.batch_step"};
+        auto x = core::make_tensor(ctx, GGML_TYPE_F32, core::TensorShape::from_dims({slots_, 1, config.hidden_size}));
+        input_ = x.tensor;
+        positions_ = ggml_new_tensor_1d(ctx_.get(), GGML_TYPE_I32, 1);
+        auto positions_value = core::wrap_tensor(positions_, core::TensorShape::from_dims({1}), GGML_TYPE_I32);
+        cache_slot_ = ggml_new_tensor_1d(ctx_.get(), GGML_TYPE_I64, slots_);
+        auto cache_slot_value = core::wrap_tensor(cache_slot_, core::TensorShape::from_dims({slots_}), GGML_TYPE_I64);
+        attention_mask_ = ggml_new_tensor_4d(ctx_.get(), GGML_TYPE_F16, cache_steps_, 1, 1, slots_);
+        auto attention_mask_value = core::wrap_tensor(
+            attention_mask_,
+            core::TensorShape::from_dims({slots_, 1, 1, cache_steps_}),
+            GGML_TYPE_F16);
+        graph_ = ggml_new_graph_custom(ctx_.get(), 65536, false);
+        auto & constants = weights_->talker_constants();
+        constants.begin_graph();
+        const auto decoder_config =
+            make_qwen_decoder_config(config, config.vocab_size, weights_->perf_mode(), GGML_PREC_F32);
+        const modules::QwenDecoderLayerModule layer_module(
+            modules::qwen_decoder_layer_config_from_stack(decoder_config.stack));
+        for (size_t layer_index = 0; layer_index < tensor_weights.layers.size(); ++layer_index) {
+            auto layer_out = layer_module.build_with_static_cache_tail(
+                ctx,
+                graph_,
+                x,
+                positions_value,
+                make_qwen_decoder_layer_weights(constants, tensor_weights.layers[layer_index]),
+                cache.key_tensor(layer_index),
+                cache.value_tensor(layer_index),
+                cache_slot_value,
+                attention_mask_value);
+            x = layer_out.output;
+        }
+        x = modules::RMSNormModule({config.hidden_size, config.rms_norm_eps, true, false})
+                .build(ctx, x, binding::norm_data(constants, tensor_weights.norm));
+        hidden_output_ = x.tensor;
+        ggml_set_output(hidden_output_);
+        auto logits = modules::LinearModule({config.hidden_size, config.vocab_size, false, GGML_PREC_F32})
+                          .build(ctx, x, binding::linear_data(constants, tensor_weights.codec_head));
+        logits_output_ = logits.tensor;
+        ggml_set_output(logits_output_);
+        ggml_build_forward_expand(graph_, logits_output_);
+        constants.finish_graph();
+        constants.ensure_uploaded();
+        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), weights_->backend());
+        if (buffer_ == nullptr) {
+            throw std::runtime_error("failed to allocate Qwen3 talker batch step graph");
+        }
+        attention_mask_buffer_.assign(
+            static_cast<size_t>(slots_ * cache_steps_), ggml_fp32_to_fp16(-INFINITY));
+        cache_slot_values_.assign(static_cast<size_t>(slots_), 0);
+    }
+
+    ~TalkerBatchStepGraph() {
+        engine::core::release_backend_graph_resources(weights_->backend(), graph_);
+        if (buffer_ != nullptr) {
+            ggml_backend_buffer_free(buffer_);
+        }
+    }
+
+    TalkerBatchStepGraph(const TalkerBatchStepGraph &) = delete;
+    TalkerBatchStepGraph & operator=(const TalkerBatchStepGraph &) = delete;
+
+    // `visible_start[b]` is slot b's left padding, `prompt_capacity` the shared
+    // cache index the first generated frame is written to. `generated_so_far`
+    // resumes an in-flight run after the cache grew and the graph was rebuilt.
+    void begin_decode_run(
+        const std::vector<int64_t> & visible_start,
+        int64_t prompt_capacity,
+        int64_t generated_so_far) {
+        if (static_cast<int64_t>(visible_start.size()) != slots_) {
+            throw std::runtime_error("Qwen3 talker batch decode requires one visible start per slot");
+        }
+        if (prompt_capacity <= 0 || prompt_capacity > cache_steps_) {
+            throw std::runtime_error("Qwen3 talker batch decode prompt capacity is out of range");
+        }
+        if (generated_so_far < 0 || prompt_capacity + generated_so_far > cache_steps_) {
+            throw std::runtime_error("Qwen3 talker batch decode resume point is out of range");
+        }
+        prompt_capacity_ = prompt_capacity;
+        generated_ = generated_so_far;
+        std::fill(attention_mask_buffer_.begin(), attention_mask_buffer_.end(), ggml_fp32_to_fp16(-INFINITY));
+        for (int64_t slot = 0; slot < slots_; ++slot) {
+            const int64_t start = visible_start[static_cast<size_t>(slot)];
+            if (start < 0 || start > prompt_capacity_) {
+                throw std::runtime_error("Qwen3 talker batch decode visible start is out of range");
+            }
+            const auto row = attention_mask_buffer_.begin() +
+                static_cast<std::ptrdiff_t>(slot * cache_steps_);
+            std::fill(
+                row + static_cast<std::ptrdiff_t>(start),
+                row + static_cast<std::ptrdiff_t>(prompt_capacity_ + generated_),
+                ggml_fp32_to_fp16(0.0F));
+        }
+    }
+
+    int64_t generated_steps() const noexcept {
+        return generated_;
+    }
+
+    const CachedStepTiming & timing() const noexcept {
+        return timing_;
+    }
+
+    // `embeddings` is slot-major {slots, hidden}; `logits_out` and `hidden_out`
+    // come back slot-major as well.
+    void run_step(
+        const std::vector<float> & embeddings,
+        std::vector<float> & logits_out,
+        std::vector<float> & hidden_out) {
+        const auto & config = weights_->assets().config.talker;
+        const int64_t step_index = prompt_capacity_ + generated_;
+        if (step_index >= cache_steps_) {
+            throw std::runtime_error("Qwen3 talker batch decode cache exhausted");
+        }
+        if (static_cast<int64_t>(embeddings.size()) != slots_ * config.hidden_size) {
+            throw std::runtime_error("Qwen3 talker batch step embedding size mismatch");
+        }
+        auto timing_start = Clock::now();
+        ggml_backend_tensor_set(input_, embeddings.data(), 0, embeddings.size() * sizeof(float));
+        const int32_t position = static_cast<int32_t>(step_index);
+        ggml_backend_tensor_set(positions_, &position, 0, sizeof(int32_t));
+        for (int64_t slot = 0; slot < slots_; ++slot) {
+            cache_slot_values_[static_cast<size_t>(slot)] = slot * cache_steps_ + step_index;
+        }
+        ggml_backend_tensor_set(
+            cache_slot_, cache_slot_values_.data(), 0, cache_slot_values_.size() * sizeof(int64_t));
+        timing_.input_upload_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        timing_start = Clock::now();
+        for (int64_t slot = 0; slot < slots_; ++slot) {
+            attention_mask_buffer_[static_cast<size_t>(slot * cache_steps_ + step_index)] =
+                ggml_fp32_to_fp16(0.0F);
+        }
+        ggml_backend_tensor_set(
+            attention_mask_,
+            attention_mask_buffer_.data(),
+            0,
+            attention_mask_buffer_.size() * sizeof(ggml_fp16_t));
+        timing_.mask_upload_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        core::set_backend_threads(weights_->backend(), weights_->threads());
+        timing_start = Clock::now();
+        const ggml_status status = engine::core::compute_backend_graph(weights_->backend(), graph_);
+        ggml_backend_synchronize(weights_->backend());
+        timing_.graph_compute_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Qwen3 talker batch step graph compute failed");
+        }
+        logits_out.resize(static_cast<size_t>(slots_ * config.vocab_size));
+        hidden_out.resize(static_cast<size_t>(slots_ * config.hidden_size));
+        timing_start = Clock::now();
+        ggml_backend_tensor_get(logits_output_, logits_out.data(), 0, logits_out.size() * sizeof(float));
+        ggml_backend_tensor_get(hidden_output_, hidden_out.data(), 0, hidden_out.size() * sizeof(float));
+        timing_.output_read_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        ++generated_;
+    }
+
+private:
+    std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights_;
+    int64_t slots_ = 0;
+    int64_t cache_steps_ = 0;
+    int64_t prompt_capacity_ = 0;
+    int64_t generated_ = 0;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+    ggml_tensor * input_ = nullptr;
+    ggml_tensor * positions_ = nullptr;
+    ggml_tensor * cache_slot_ = nullptr;
+    ggml_tensor * attention_mask_ = nullptr;
+    ggml_tensor * hidden_output_ = nullptr;
+    ggml_tensor * logits_output_ = nullptr;
+    std::vector<ggml_fp16_t> attention_mask_buffer_;
+    std::vector<int64_t> cache_slot_values_;
+    ggml_cgraph * graph_ = nullptr;
+    ggml_backend_buffer_t buffer_ = nullptr;
+    CachedStepTiming timing_;
+};
+
+// Batched code predictor. Every slot's frame walks the same 16-group sequence
+// in lockstep, so the per-frame sub-talker batches naturally: one 2-step
+// prefill plus one step per remaining group, each advancing all slots at once.
+// Without this the 15 batch-1 sub-talker passes per frame would swallow the
+// speedup the batched talker step buys.
+class CodePredictorBatchGraph {
+public:
+    CodePredictorBatchGraph(std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights, int64_t slots)
+        : weights_(std::move(weights)),
+          slots_(slots),
+          code_groups_(weights_->assets().config.talker.num_code_groups) {
+        if (slots_ <= 0) {
+            throw std::runtime_error("Qwen3 batch code predictor requires positive slot count");
+        }
+        if (code_groups_ <= 1) {
+            throw std::runtime_error("Qwen3 code predictor requires multiple code groups");
+        }
+        ggml_init_params params{weights_->graph_arena_bytes(), nullptr, true};
+        ctx_.reset(ggml_init(params));
+        if (ctx_ == nullptr) {
+            throw std::runtime_error("failed to initialize Qwen3 batch code predictor graph context");
+        }
+        const auto & config = weights_->assets().config.code_predictor;
+        const int64_t head_dim = attention_head_dim(config);
+        core::ModuleBuildContext ctx{ctx_.get(), "qwen3_tts.talker.batch_code_predictor"};
+        cache_keys_.reserve(static_cast<size_t>(config.num_hidden_layers));
+        cache_values_.reserve(static_cast<size_t>(config.num_hidden_layers));
+        for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+            cache_keys_.push_back(core::make_tensor(
+                ctx,
+                GGML_TYPE_F32,
+                core::TensorShape::from_dims({slots_, code_groups_, config.num_key_value_heads, head_dim})));
+            cache_values_.push_back(core::make_tensor(
+                ctx,
+                GGML_TYPE_F32,
+                core::TensorShape::from_dims({slots_, code_groups_, config.num_key_value_heads, head_dim})));
+        }
+        auto & constants = weights_->code_predictor_constants();
+        constants.begin_graph();
+        build_prefill_graph(ctx, constants);
+        step_graphs_.reserve(static_cast<size_t>(code_groups_ - 2));
+        for (int64_t group = 1; group < code_groups_ - 1; ++group) {
+            step_graphs_.push_back(build_step_graph(ctx, constants, group));
+        }
+        constants.finish_graph();
+        constants.ensure_uploaded();
+        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), weights_->backend());
+        if (buffer_ == nullptr) {
+            throw std::runtime_error("failed to allocate Qwen3 batch code predictor graph");
+        }
+        // Never-written steps are masked out but still read by the attention
+        // window, so the cache must not hold garbage.
+        for (size_t layer = 0; layer < cache_keys_.size(); ++layer) {
+            ggml_backend_tensor_memset(cache_keys_[layer].tensor, 0, 0, ggml_nbytes(cache_keys_[layer].tensor));
+            ggml_backend_tensor_memset(cache_values_[layer].tensor, 0, 0, ggml_nbytes(cache_values_[layer].tensor));
+        }
+        step_attention_mask_buffer_.assign(
+            static_cast<size_t>(slots_ * code_groups_), ggml_fp32_to_fp16(-INFINITY));
+        cache_slot_values_.assign(static_cast<size_t>(slots_), 0);
+        int32_t prefill_positions[2] = {0, 1};
+        ggml_backend_tensor_set(prefill_positions_, prefill_positions, 0, sizeof(prefill_positions));
+    }
+
+    ~CodePredictorBatchGraph() {
+        engine::core::release_backend_graph_resources(weights_->backend(), prefill_graph_);
+        for (auto & step_graph : step_graphs_) {
+            engine::core::release_backend_graph_resources(weights_->backend(), step_graph.graph);
+        }
+        if (buffer_ != nullptr) {
+            ggml_backend_buffer_free(buffer_);
+        }
+    }
+
+    CodePredictorBatchGraph(const CodePredictorBatchGraph &) = delete;
+    CodePredictorBatchGraph & operator=(const CodePredictorBatchGraph &) = delete;
+
+    // All slot-major inputs must hold valid rows for every slot; `wants_frame`
+    // only gates sampling and output, inactive slots ride along and their codes
+    // are ignored. Codes come back as {slots, code_groups}.
+    void generate_frames(
+        const std::vector<float> & talker_hidden,
+        const std::vector<int32_t> & first_codes,
+        const std::vector<char> & wants_frame,
+        const std::vector<const Qwen3TTSGenerationOptions *> & options,
+        std::vector<std::mt19937> & rngs,
+        std::vector<uint64_t> & sample_call_indices,
+        std::vector<int32_t> & codes_out) {
+        const auto & config = weights_->assets().config;
+        const int64_t hidden = config.talker.hidden_size;
+        if (static_cast<int64_t>(talker_hidden.size()) != slots_ * hidden ||
+            static_cast<int64_t>(first_codes.size()) != slots_ ||
+            static_cast<int64_t>(wants_frame.size()) != slots_ ||
+            static_cast<int64_t>(options.size()) != slots_ ||
+            static_cast<int64_t>(rngs.size()) != slots_ ||
+            static_cast<int64_t>(sample_call_indices.size()) != slots_) {
+            throw std::runtime_error("Qwen3 batch code predictor input shape mismatch");
+        }
+        codes_out.assign(static_cast<size_t>(slots_ * code_groups_), 0);
+        std::vector<float> embeddings(static_cast<size_t>(slots_ * 2 * hidden), 0.0F);
+        for (int64_t slot = 0; slot < slots_; ++slot) {
+            const int32_t first_code = first_codes[static_cast<size_t>(slot)];
+            if (first_code < 0 || first_code >= config.talker.vocab_size) {
+                throw std::runtime_error("Qwen3 batch code predictor first code out of range");
+            }
+            auto * dst = embeddings.data() + static_cast<size_t>(slot * 2 * hidden);
+            std::copy(
+                talker_hidden.begin() + static_cast<std::ptrdiff_t>(slot * hidden),
+                talker_hidden.begin() + static_cast<std::ptrdiff_t>((slot + 1) * hidden),
+                dst);
+            const auto code_embed = lookup_rows(weights_->weights().codec_embedding, hidden, {first_code});
+            std::copy(code_embed.begin(), code_embed.end(), dst + hidden);
+            codes_out[static_cast<size_t>(slot * code_groups_)] = first_code;
+        }
+        auto timing_start = Clock::now();
+        ggml_backend_tensor_set(prefill_input_, embeddings.data(), 0, embeddings.size() * sizeof(float));
+        timing_.input_upload_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        core::set_backend_threads(weights_->backend(), weights_->threads());
+        timing_start = Clock::now();
+        const ggml_status prefill_status = engine::core::compute_backend_graph(weights_->backend(), prefill_graph_);
+        ggml_backend_synchronize(weights_->backend());
+        timing_.graph_compute_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        if (prefill_status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Qwen3 batch code predictor prefill graph compute failed");
+        }
+        std::vector<float> logits = read_logits(prefill_logits_);
+        std::vector<int32_t> codes(static_cast<size_t>(slots_), 0);
+        sample_group(logits, wants_frame, options, rngs, sample_call_indices, codes);
+        for (int64_t slot = 0; slot < slots_; ++slot) {
+            codes_out[static_cast<size_t>(slot * code_groups_ + 1)] = codes[static_cast<size_t>(slot)];
+        }
+        std::vector<float> step_embeddings(static_cast<size_t>(slots_ * hidden), 0.0F);
+        for (int64_t group = 1; group < code_groups_ - 1; ++group) {
+            for (int64_t slot = 0; slot < slots_; ++slot) {
+                const auto row = lookup_rows(
+                    weights_->weights().code_predictor_embeddings.at(static_cast<size_t>(group - 1)),
+                    hidden,
+                    {codes[static_cast<size_t>(slot)]});
+                std::copy(
+                    row.begin(),
+                    row.end(),
+                    step_embeddings.begin() + static_cast<std::ptrdiff_t>(slot * hidden));
+            }
+            run_step(group, step_embeddings, logits);
+            sample_group(logits, wants_frame, options, rngs, sample_call_indices, codes);
+            for (int64_t slot = 0; slot < slots_; ++slot) {
+                codes_out[static_cast<size_t>(slot * code_groups_ + group + 1)] =
+                    codes[static_cast<size_t>(slot)];
+            }
+        }
+    }
+
+    const CodePredictorTiming & timing() const noexcept {
+        return timing_;
+    }
+
+private:
+    struct StepGraph {
+        ggml_tensor * input = nullptr;
+        ggml_tensor * position = nullptr;
+        ggml_tensor * cache_slot = nullptr;
+        ggml_tensor * attention_mask = nullptr;
+        ggml_tensor * logits = nullptr;
+        ggml_cgraph * graph = nullptr;
+    };
+
+    void build_prefill_graph(core::ModuleBuildContext & ctx, core::ConstantTensorCache & constants) {
+        const auto & root_config = weights_->assets().config;
+        const auto & config = root_config.code_predictor;
+        const auto & tensor_weights = weights_->weights();
+        const int64_t head_dim = attention_head_dim(config);
+        auto input = core::make_tensor(
+            ctx, GGML_TYPE_F32, core::TensorShape::from_dims({slots_, 2, root_config.talker.hidden_size}));
+        prefill_input_ = input.tensor;
+        auto x = project_code_predictor_input(ctx, input, tensor_weights, root_config, constants, GGML_PREC_F32);
+        prefill_positions_ = ggml_new_tensor_1d(ctx_.get(), GGML_TYPE_I32, 2);
+        auto positions_value = core::wrap_tensor(prefill_positions_, core::TensorShape::from_dims({2}), GGML_TYPE_I32);
+        prefill_graph_ = ggml_new_graph_custom(ctx_.get(), 32768, false);
+        auto decoder_config =
+            make_qwen_decoder_config(config, config.vocab_size, weights_->perf_mode(), GGML_PREC_F32);
+        // The two-step prefill runs with the plain manual-repeat attention even
+        // in flash mode: a batched flash prefill would need the mask broadcast
+        // across the slot axis, which the flash path has never exercised, and
+        // two tiny steps gain nothing from flash anyway. Manual repeat applies
+        // the causal diagonal mask internally, so no mask tensor is needed.
+        decoder_config.stack.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::ManualRepeat;
+        auto decoder_out = modules::QwenCausalDecoderModule(decoder_config)
+                               .build(
+                                   ctx,
+                                   x,
+                                   positions_value,
+                                   make_qwen_decoder_weights(
+                                       constants,
+                                       tensor_weights.code_predictor.layers,
+                                       tensor_weights.code_predictor.norm,
+                                       tensor_weights.code_predictor.lm_heads.front()),
+                                   std::nullopt,
+                                   std::nullopt);
+        for (size_t layer_index = 0; layer_index < decoder_out.state.layers.size(); ++layer_index) {
+            const auto & layer = decoder_out.state.layers[layer_index];
+            if (!layer.key.has_value() || !layer.value.has_value()) {
+                throw std::runtime_error("Qwen3 batch code predictor prefill did not return K/V state");
+            }
+            auto key_dest = batch_cache_view_all_slots(
+                ctx, cache_keys_[layer_index], 0, 2, config.num_key_value_heads, head_dim);
+            auto value_dest = batch_cache_view_all_slots(
+                ctx, cache_values_[layer_index], 0, 2, config.num_key_value_heads, head_dim);
+            ggml_build_forward_expand(prefill_graph_, ggml_cpy(ctx.ggml, layer.key->tensor, key_dest.tensor));
+            ggml_build_forward_expand(prefill_graph_, ggml_cpy(ctx.ggml, layer.value->tensor, value_dest.tensor));
+        }
+        prefill_logits_ = decoder_out.logits.tensor;
+        ggml_set_output(prefill_logits_);
+        ggml_build_forward_expand(prefill_graph_, prefill_logits_);
+    }
+
+    StepGraph build_step_graph(
+        core::ModuleBuildContext & ctx,
+        core::ConstantTensorCache & constants,
+        int64_t group) {
+        const auto & root_config = weights_->assets().config;
+        const auto & config = root_config.code_predictor;
+        const auto & tensor_weights = weights_->weights();
+        StepGraph step;
+        auto input = core::make_tensor(
+            ctx, GGML_TYPE_F32, core::TensorShape::from_dims({slots_, 1, root_config.talker.hidden_size}));
+        step.input = input.tensor;
+        auto x = project_code_predictor_input(ctx, input, tensor_weights, root_config, constants, GGML_PREC_F32);
+        step.position = ggml_new_tensor_1d(ctx_.get(), GGML_TYPE_I32, 1);
+        auto position_value = core::wrap_tensor(step.position, core::TensorShape::from_dims({1}), GGML_TYPE_I32);
+        step.cache_slot = ggml_new_tensor_1d(ctx_.get(), GGML_TYPE_I64, slots_);
+        auto cache_slot_value = core::wrap_tensor(step.cache_slot, core::TensorShape::from_dims({slots_}), GGML_TYPE_I64);
+        step.attention_mask = ggml_new_tensor_4d(ctx_.get(), GGML_TYPE_F16, code_groups_, 1, 1, slots_);
+        auto attention_mask_value = core::wrap_tensor(
+            step.attention_mask,
+            core::TensorShape::from_dims({slots_, 1, 1, code_groups_}),
+            GGML_TYPE_F16);
+        step.graph = ggml_new_graph_custom(ctx_.get(), 32768, false);
+        const auto & step_head = tensor_weights.code_predictor.lm_heads.at(static_cast<size_t>(group));
+        const auto decoder_config =
+            make_qwen_decoder_config(config, config.vocab_size, weights_->perf_mode(), GGML_PREC_F32);
+        const modules::QwenDecoderLayerModule layer_module(
+            modules::qwen_decoder_layer_config_from_stack(decoder_config.stack));
+        for (size_t layer_index = 0; layer_index < tensor_weights.code_predictor.layers.size(); ++layer_index) {
+            auto layer_out = layer_module.build_with_static_cache_tail(
+                ctx,
+                step.graph,
+                x,
+                position_value,
+                make_qwen_decoder_layer_weights(constants, tensor_weights.code_predictor.layers[layer_index]),
+                cache_keys_[layer_index],
+                cache_values_[layer_index],
+                cache_slot_value,
+                attention_mask_value);
+            x = layer_out.output;
+        }
+        x = modules::RMSNormModule({config.hidden_size, config.rms_norm_eps, true, false})
+                .build(ctx, x, binding::norm_data(constants, tensor_weights.code_predictor.norm));
+        auto logits = modules::LinearModule({config.hidden_size, config.vocab_size, false, GGML_PREC_F32})
+                          .build(ctx, x, binding::linear_data(constants, step_head));
+        step.logits = logits.tensor;
+        ggml_set_output(step.logits);
+        ggml_build_forward_expand(step.graph, step.logits);
+        return step;
+    }
+
+    void run_step(int64_t group, const std::vector<float> & embeddings, std::vector<float> & logits_out) {
+        auto & step_graph = step_graphs_.at(static_cast<size_t>(group - 1));
+        auto timing_start = Clock::now();
+        ggml_backend_tensor_set(step_graph.input, embeddings.data(), 0, embeddings.size() * sizeof(float));
+        // Rows [0, group + 1) hold the prefill and the groups sampled so far;
+        // this step writes row group + 1 at the same position, mirroring the
+        // single-sequence code predictor's valid_steps/current_end bookkeeping.
+        const int32_t position = static_cast<int32_t>(group + 1);
+        ggml_backend_tensor_set(step_graph.position, &position, 0, sizeof(position));
+        for (int64_t slot = 0; slot < slots_; ++slot) {
+            cache_slot_values_[static_cast<size_t>(slot)] = slot * code_groups_ + group + 1;
+        }
+        ggml_backend_tensor_set(
+            step_graph.cache_slot, cache_slot_values_.data(), 0, cache_slot_values_.size() * sizeof(int64_t));
+        std::fill(
+            step_attention_mask_buffer_.begin(),
+            step_attention_mask_buffer_.end(),
+            ggml_fp32_to_fp16(-INFINITY));
+        for (int64_t slot = 0; slot < slots_; ++slot) {
+            const auto row = step_attention_mask_buffer_.begin() +
+                static_cast<std::ptrdiff_t>(slot * code_groups_);
+            std::fill(row, row + static_cast<std::ptrdiff_t>(group + 2), ggml_fp32_to_fp16(0.0F));
+        }
+        ggml_backend_tensor_set(
+            step_graph.attention_mask,
+            step_attention_mask_buffer_.data(),
+            0,
+            step_attention_mask_buffer_.size() * sizeof(ggml_fp16_t));
+        timing_.input_upload_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        core::set_backend_threads(weights_->backend(), weights_->threads());
+        timing_start = Clock::now();
+        const ggml_status status = engine::core::compute_backend_graph(weights_->backend(), step_graph.graph);
+        ggml_backend_synchronize(weights_->backend());
+        timing_.graph_compute_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Qwen3 batch code predictor step graph compute failed");
+        }
+        logits_out = read_logits(step_graph.logits);
+    }
+
+    std::vector<float> read_logits(ggml_tensor * logits_tensor) {
+        const auto & config = weights_->assets().config.code_predictor;
+        std::vector<float> out(static_cast<size_t>(slots_ * config.vocab_size));
+        const auto timing_start = Clock::now();
+        ggml_backend_tensor_get(logits_tensor, out.data(), 0, out.size() * sizeof(float));
+        timing_.output_read_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+        return out;
+    }
+
+    void sample_group(
+        const std::vector<float> & logits,
+        const std::vector<char> & wants_frame,
+        const std::vector<const Qwen3TTSGenerationOptions *> & options,
+        std::vector<std::mt19937> & rngs,
+        std::vector<uint64_t> & sample_call_indices,
+        std::vector<int32_t> & codes) {
+        const auto & config = weights_->assets().config.code_predictor;
+        for (int64_t slot = 0; slot < slots_; ++slot) {
+            const auto index = static_cast<size_t>(slot);
+            if (wants_frame[index] == 0) {
+                codes[index] = 0;
+                continue;
+            }
+            std::vector<float> slot_logits(
+                logits.begin() + static_cast<std::ptrdiff_t>(slot * config.vocab_size),
+                logits.begin() + static_cast<std::ptrdiff_t>((slot + 1) * config.vocab_size));
+            const auto & opts = *options[index];
+            codes[index] = opts.subtalker_do_sample
+                ? sample_index(
+                    slot_logits,
+                    opts.subtalker_top_k,
+                    opts.subtalker_top_p,
+                    opts.subtalker_temperature,
+                    rngs[index],
+                    weights_->sampling_policy(),
+                    opts.seed,
+                    sample_call_indices[index]++)
+                : argmax_index(slot_logits);
+        }
+    }
+
+    std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights_;
+    int64_t slots_ = 0;
+    int64_t code_groups_ = 0;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+    std::vector<core::TensorValue> cache_keys_;
+    std::vector<core::TensorValue> cache_values_;
+    ggml_tensor * prefill_input_ = nullptr;
+    ggml_tensor * prefill_positions_ = nullptr;
+    ggml_tensor * prefill_logits_ = nullptr;
+    ggml_cgraph * prefill_graph_ = nullptr;
+    std::vector<StepGraph> step_graphs_;
+    std::vector<ggml_fp16_t> step_attention_mask_buffer_;
+    std::vector<int64_t> cache_slot_values_;
+    ggml_backend_buffer_t buffer_ = nullptr;
+    CodePredictorTiming timing_;
+};
+
 class Qwen3TalkerStepRuntime::Impl {
 public:
     Impl(
@@ -1838,10 +2744,302 @@ public:
         return out;
     }
 
+    std::vector<Qwen3TalkerCodes> generate_batch(const std::vector<Qwen3TalkerBatchItem> & items) {
+        if (items.empty()) {
+            throw std::runtime_error("Qwen3 talker batch generation requires at least one item");
+        }
+        if (items.size() == 1) {
+            // Nothing to amortize, and the single-sequence path is the tuned one.
+            return {generate(items.front().prefill, items.front().options, items.front().repetition_penalty)};
+        }
+        const auto total_start = Clock::now();
+        const auto & config = weights_->assets().config.talker;
+        const int64_t slots = static_cast<int64_t>(items.size());
+        const int64_t hidden = config.hidden_size;
+        const int64_t vocab = config.vocab_size;
+
+        // The batch builds its own graphs and cache; drop the single-request
+        // ones first so both never occupy the backend at the same time. The
+        // single path lazily rebuilds afterwards.
+        graph_.reset();
+        cached_step_graph_.reset();
+        code_predictor_graph_.reset();
+        cached_prompt_prefill_.reset();
+        cached_prompt_state_.reset();
+        cached_prefill_output_.reset();
+
+        const auto prompt_state_start = Clock::now();
+        struct SlotPlan {
+            PromptEmbeddingState state;
+            int64_t prompt_steps = 0;
+            int64_t trailing_rows = 0;
+            int64_t max_new_tokens = 0;
+        };
+        std::vector<SlotPlan> plans;
+        plans.reserve(items.size());
+        int64_t prompt_capacity = 0;
+        int64_t max_new_max = 0;
+        for (size_t index = 0; index < items.size(); ++index) {
+            const auto & item = items[index];
+            SlotPlan plan;
+            plan.max_new_tokens = item.options.max_new_tokens;
+            if (plan.max_new_tokens <= 0 || plan.max_new_tokens > generation_capacity_) {
+                throw std::runtime_error(
+                    "Qwen3 talker batch item " + std::to_string(index) +
+                    " token count exceeds capacity");
+            }
+            plan.state = build_prompt_state(item.prefill, weights_->assets().config, weights_->weights());
+            plan.prompt_steps = static_cast<int64_t>(plan.state.prompt.size()) / hidden;
+            plan.trailing_rows = static_cast<int64_t>(plan.state.trailing_text.size()) / hidden;
+            if (plan.prompt_steps <= 0 || plan.prompt_steps > prompt_capacity_) {
+                throw std::runtime_error(
+                    "Qwen3 talker batch item " + std::to_string(index) +
+                    " prompt exceeds step runtime capacity");
+            }
+            prompt_capacity = std::max(prompt_capacity, plan.prompt_steps);
+            max_new_max = std::max(max_new_max, plan.max_new_tokens);
+            plans.push_back(std::move(plan));
+        }
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.prompt_state_ms",
+            engine::debug::elapsed_ms(prompt_state_start, Clock::now()));
+        debug::trace_log_scalar("qwen3_tts.talker.batch.slots", slots);
+        debug::trace_log_scalar("qwen3_tts.talker.batch.prompt_capacity", prompt_capacity);
+
+        const int64_t max_cache_steps = prompt_capacity + max_new_max;
+        // The attention window covers the whole allocated cache every step, so
+        // start at the same generated-frame bucket the single path uses and
+        // grow on demand instead of sizing for the worst case up front.
+        const int64_t initial_cache_steps =
+            prompt_capacity + std::min<int64_t>(max_new_max, kInitialGeneratedStepCacheFrames);
+        const int64_t kv_heads = config.num_key_value_heads;
+        const int64_t head_dim = attention_head_dim(config);
+        auto cache = std::make_unique<Qwen3BatchKVCache>(
+            *weights_,
+            "qwen3_tts.talker.batch_kv_cache",
+            config.num_hidden_layers,
+            kv_heads,
+            head_dim,
+            slots,
+            initial_cache_steps);
+
+        const auto prefill_start = Clock::now();
+        std::vector<int64_t> visible_start(static_cast<size_t>(slots), 0);
+        std::vector<float> logits_flat(static_cast<size_t>(slots * vocab), 0.0F);
+        std::vector<float> hidden_flat(static_cast<size_t>(slots * hidden), 0.0F);
+        for (int64_t slot = 0; slot < slots; ++slot) {
+            const auto index = static_cast<size_t>(slot);
+            visible_start[index] = prompt_capacity - plans[index].prompt_steps;
+            TalkerBatchPrefillGraph prefill(
+                weights_, *cache, slot, plans[index].prompt_steps, visible_start[index]);
+            const auto result = prefill.run(plans[index].state.prompt);
+            std::copy(
+                result.logits.values.begin(),
+                result.logits.values.end(),
+                logits_flat.begin() + static_cast<std::ptrdiff_t>(slot * vocab));
+            std::copy(
+                result.last_hidden.values.begin(),
+                result.last_hidden.values.end(),
+                hidden_flat.begin() + static_cast<std::ptrdiff_t>(slot * hidden));
+        }
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.prefill_ms",
+            engine::debug::elapsed_ms(prefill_start, Clock::now()));
+
+        const auto build_start = Clock::now();
+        CodePredictorBatchGraph code_predictor(weights_, slots);
+        auto step_graph = std::make_unique<TalkerBatchStepGraph>(weights_, *cache);
+        step_graph->begin_decode_run(visible_start, prompt_capacity, 0);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.graph_build_ms",
+            engine::debug::elapsed_ms(build_start, Clock::now()));
+
+        std::vector<Qwen3TalkerCodes> out(static_cast<size_t>(slots));
+        std::vector<std::mt19937> rngs;
+        rngs.reserve(items.size());
+        std::vector<uint64_t> sample_call_indices(static_cast<size_t>(slots), 0);
+        std::vector<const Qwen3TTSGenerationOptions *> options(static_cast<size_t>(slots), nullptr);
+        std::vector<std::vector<int32_t>> generated_first_codes(static_cast<size_t>(slots));
+        std::vector<char> done(static_cast<size_t>(slots), 0);
+        std::vector<char> wants_frame(static_cast<size_t>(slots), 0);
+        std::vector<int32_t> first_codes(static_cast<size_t>(slots), 0);
+        std::vector<int32_t> frame_codes;
+        std::vector<float> embed_flat(static_cast<size_t>(slots * hidden), 0.0F);
+        for (int64_t slot = 0; slot < slots; ++slot) {
+            const auto index = static_cast<size_t>(slot);
+            rngs.emplace_back(items[index].options.seed);
+            options[index] = &items[index].options;
+            out[index].generated_codes.code_groups = config.num_code_groups;
+            out[index].decoder_input_codes.code_groups = config.num_code_groups;
+            generated_first_codes[index].reserve(static_cast<size_t>(plans[index].max_new_tokens));
+            // Finished slots keep riding along; give them a finite embedding
+            // from the start so a slot that stops at step 0 never feeds garbage.
+            std::copy(
+                plans[index].state.tts_pad.begin(),
+                plans[index].state.tts_pad.end(),
+                embed_flat.begin() + static_cast<std::ptrdiff_t>(slot * hidden));
+        }
+
+        CachedStepTiming step_timing_total;
+        CodePredictorTiming code_predictor_timing;
+        double processor_ms = 0.0;
+        double code_predictor_ms = 0.0;
+        double frame_embed_ms = 0.0;
+        double step_ms = 0.0;
+        int64_t generated_steps = 0;
+        for (int64_t step = 0;; ++step) {
+            bool any_pending = false;
+            const auto processor_start = Clock::now();
+            for (int64_t slot = 0; slot < slots; ++slot) {
+                const auto index = static_cast<size_t>(slot);
+                wants_frame[index] = 0;
+                first_codes[index] = 0;
+                if (done[index] != 0) {
+                    continue;
+                }
+                std::vector<float> logits(
+                    logits_flat.begin() + static_cast<std::ptrdiff_t>(slot * vocab),
+                    logits_flat.begin() + static_cast<std::ptrdiff_t>((slot + 1) * vocab));
+                apply_main_talker_processors(
+                    logits, config, generated_first_codes[index], step, items[index].repetition_penalty);
+                const auto & opts = items[index].options;
+                const int32_t first_code = opts.do_sample
+                    ? sample_index(
+                        logits,
+                        opts.top_k,
+                        opts.top_p,
+                        opts.temperature,
+                        rngs[index],
+                        weights_->sampling_policy(),
+                        opts.seed,
+                        sample_call_indices[index]++)
+                    : argmax_index(logits);
+                if (first_code == config.codec_eos_token_id) {
+                    done[index] = 1;
+                    continue;
+                }
+                if (step + 1 >= plans[index].max_new_tokens) {
+                    // Same semantics as the single path: the frame that would
+                    // exceed max_new_tokens is discarded, not emitted.
+                    done[index] = 1;
+                    continue;
+                }
+                generated_first_codes[index].push_back(first_code);
+                first_codes[index] = first_code;
+                wants_frame[index] = 1;
+                any_pending = true;
+            }
+            processor_ms += engine::debug::elapsed_ms(processor_start, Clock::now());
+            if (!any_pending) {
+                break;
+            }
+
+            const auto code_predictor_start = Clock::now();
+            code_predictor.generate_frames(
+                hidden_flat, first_codes, wants_frame, options, rngs, sample_call_indices, frame_codes);
+            code_predictor_ms += engine::debug::elapsed_ms(code_predictor_start, Clock::now());
+
+            const auto frame_embed_start = Clock::now();
+            for (int64_t slot = 0; slot < slots; ++slot) {
+                const auto index = static_cast<size_t>(slot);
+                if (wants_frame[index] == 0) {
+                    continue;
+                }
+                Qwen3TalkerFrameCodes frame;
+                frame.codes.assign(
+                    frame_codes.begin() + static_cast<std::ptrdiff_t>(slot * config.num_code_groups),
+                    frame_codes.begin() + static_cast<std::ptrdiff_t>((slot + 1) * config.num_code_groups));
+                out[index].generated_codes.codes.insert(
+                    out[index].generated_codes.codes.end(), frame.codes.begin(), frame.codes.end());
+                ++out[index].generated_codes.frames;
+                const auto text_hidden = step < plans[index].trailing_rows
+                    ? row_at(plans[index].state.trailing_text, step, hidden)
+                    : plans[index].state.tts_pad;
+                const auto embed = frame_embedding(frame, text_hidden, weights_->weights(), config);
+                std::copy(
+                    embed.begin(),
+                    embed.end(),
+                    embed_flat.begin() + static_cast<std::ptrdiff_t>(slot * hidden));
+            }
+            frame_embed_ms += engine::debug::elapsed_ms(frame_embed_start, Clock::now());
+
+            if (prompt_capacity + generated_steps >= cache->cache_steps()) {
+                const int64_t valid_steps = prompt_capacity + generated_steps;
+                const int64_t grown_cache_steps = std::min(
+                    max_cache_steps, std::max(cache->cache_steps() * 2, valid_steps + 1));
+                if (grown_cache_steps <= cache->cache_steps()) {
+                    throw std::runtime_error("Qwen3 talker batch cache cannot grow");
+                }
+                step_timing_total = accumulate_step_timing(step_timing_total, step_graph->timing());
+                step_graph.reset();
+                auto grown = std::make_unique<Qwen3BatchKVCache>(
+                    *weights_,
+                    "qwen3_tts.talker.batch_kv_cache",
+                    config.num_hidden_layers,
+                    kv_heads,
+                    head_dim,
+                    slots,
+                    grown_cache_steps);
+                copy_qwen3_batch_kv_cache(*weights_, *grown, *cache, valid_steps);
+                cache = std::move(grown);
+                debug::trace_log_scalar("qwen3_tts.talker.batch.kv_cache_grown_steps", grown_cache_steps);
+                step_graph = std::make_unique<TalkerBatchStepGraph>(weights_, *cache);
+                step_graph->begin_decode_run(visible_start, prompt_capacity, generated_steps);
+            }
+
+            const auto step_start = Clock::now();
+            step_graph->run_step(embed_flat, logits_flat, hidden_flat);
+            step_ms += engine::debug::elapsed_ms(step_start, Clock::now());
+            ++generated_steps;
+        }
+        step_timing_total = accumulate_step_timing(step_timing_total, step_graph->timing());
+        code_predictor_timing = code_predictor.timing();
+
+        for (int64_t slot = 0; slot < slots; ++slot) {
+            const auto index = static_cast<size_t>(slot);
+            if (items[index].prefill.reference_codes.has_value()) {
+                out[index].decoder_input_codes.codes = items[index].prefill.reference_codes->codes;
+                out[index].decoder_input_codes.frames = items[index].prefill.reference_codes->frames;
+            }
+            out[index].decoder_input_codes.codes.insert(
+                out[index].decoder_input_codes.codes.end(),
+                out[index].generated_codes.codes.begin(),
+                out[index].generated_codes.codes.end());
+            out[index].decoder_input_codes.frames += out[index].generated_codes.frames;
+        }
+
+        debug::timing_log_scalar("qwen3_tts.talker.batch.decode.steps", generated_steps);
+        debug::timing_log_scalar("qwen3_tts.talker.batch.processor_ms", processor_ms);
+        debug::timing_log_scalar("qwen3_tts.talker.batch.code_predictor_ms", code_predictor_ms);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.code_predictor.input_upload_ms", code_predictor_timing.input_upload_ms);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.code_predictor.graph.compute_ms", code_predictor_timing.graph_compute_ms);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.code_predictor.output_read_ms", code_predictor_timing.output_read_ms);
+        debug::timing_log_scalar("qwen3_tts.talker.batch.frame_embed_ms", frame_embed_ms);
+        debug::timing_log_scalar("qwen3_tts.talker.batch.cached_step_ms", step_ms);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.cached_step.input_upload_ms", step_timing_total.input_upload_ms);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.cached_step.mask_upload_ms", step_timing_total.mask_upload_ms);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.cached_step.graph.compute_ms", step_timing_total.graph_compute_ms);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.cached_step.output_read_ms", step_timing_total.output_read_ms);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.batch.total_ms", engine::debug::elapsed_ms(total_start, Clock::now()));
+        return out;
+    }
+
     int64_t release_cached_step_graph() {
         const int64_t released_steps = cached_step_graph_ != nullptr ? cached_step_graph_->cache_steps() : 0;
         cached_step_graph_.reset();
         return released_steps;
+    }
+
+    core::BackendType backend_type() const {
+        return weights_->backend_type();
     }
 
 private:
@@ -1889,8 +3087,17 @@ Qwen3TalkerCodes Qwen3TalkerStepRuntime::generate(
     return impl_->generate(prefill, options, repetition_penalty);
 }
 
+std::vector<Qwen3TalkerCodes> Qwen3TalkerStepRuntime::generate_batch(
+    const std::vector<Qwen3TalkerBatchItem> & items) {
+    return impl_->generate_batch(items);
+}
+
 int64_t Qwen3TalkerStepRuntime::release_cached_step_graph() {
     return impl_->release_cached_step_graph();
+}
+
+core::BackendType Qwen3TalkerStepRuntime::backend_type() const {
+    return impl_->backend_type();
 }
 
 Qwen3Talker::Qwen3Talker(Qwen3TTSTalkerConfig config) : config_(std::move(config)) {}

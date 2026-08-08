@@ -875,6 +875,10 @@ engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel
     if (const auto * value = body.find("instructions")) {
         request.options["instruct"] = value->as_string();
     }
+    // Packaged-speaker selection (Qwen3 CustomVoice and friends), mirroring the
+    // CLI's --speaker. "voice" also reaches the same place via cached_voice_id,
+    // but only when it does not name a configured voice preset.
+    add_option_from_json(request.options, body, "speaker", "speaker");
 
     bool voice_field_is_preset = false;
     const auto * preset = select_voice_preset(model, body, voice_field_is_preset);

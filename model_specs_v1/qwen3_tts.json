@@ -187,6 +187,15 @@
         "default": 1
       },
       {
+        "name": "max_batch",
+        "type": "int",
+        "description": "Maximum requests decoded together in one batched AR pass; default 1 (disabled). Raises offline batch throughput because the per-token weight read is shared across sequences; does not change single-request latency. Capped at 8 on CUDA, where ggml vector-matmul kernels stop covering the batch and the fallback path is far slower.",
+        "required": false,
+        "min": 1,
+        "default": 1,
+        "max": 8
+      },
+      {
         "name": "weight_type",
         "type": "enum",
         "description": "Shared talker matmul weight storage type; default native.",

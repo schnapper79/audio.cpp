@@ -473,7 +473,12 @@ Notes:
 - Requests are grouped by reference voice and sorted by length internally. Slots run in lockstep until the longest one finishes, so batching requests of similar length wastes the least work.
 - VRAM grows with one KV cache per slot. The cache starts at a bucketed size and doubles on demand, so short requests do not pay for a large `--max-tokens`.
 - Batched matmuls reduce in a different order than the single-sequence path, so sampled output for a given seed is close to but not bit-identical with `max_batch=1`.
-- If any request in a batch hits `max_tokens` before its end-of-audio token, the whole batch fails. Keep `--max-tokens` generous for unattended runs.
+- A request that hits `max_tokens` before its end-of-audio token fails alone with a per-request error; the other requests in the batch still return their audio. Keep `--max-tokens` generous for unattended runs.
+
+Qwen3 TTS supports the same mechanism through `qwen3_tts.max_batch`; see
+[docs/models/qwen3.md](models/qwen3.md#qwen3-tts-batching) for the details that
+differ (per-frame code predictor batching, cloned voices, truncation
+semantics).
 
 ## Fish Audio S2 Pro
 

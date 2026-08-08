@@ -237,6 +237,8 @@ option parsing.
 
 If no request voice is provided and the configured model has `default_voice_preset`, the server injects that preset automatically. Request-level `voice`, `voice_ref`, and `reference_text` override the configured default.
 
+For models with packaged speakers (Qwen3 CustomVoice, say), `"speaker": "vivian"` selects one, mirroring the CLI's `--speaker`. A `"voice"` value that does not name a configured preset reaches the same place as the model-native cached voice id.
+
 Set `"response_format": "json"` to receive base64 WAV in a JSON response.
 
 For streaming-capable TTS models configured with `mode: "streaming"`, `stream_format` follows the OpenAI speech streaming shape:
@@ -257,6 +259,26 @@ curl -N http://127.0.0.1:8080/v1/audio/speech \
 ```
 
 The SSE stream emits `speech.audio.delta` events with base64 PCM chunks, then `speech.audio.done`, then `data: [DONE]`. VoxCPM2 streaming requires `retry_badcase=false` because retrying a completed bad case is an offline-only behavior. Set `"stream_format": "audio"` with `"response_format": "pcm"` to receive raw PCM bytes over chunked transfer encoding instead.
+
+### `POST /v1/audio/speech/batch`
+
+Runs several speech requests in one call. For model families with batched decode (Higgs Audio via `higgs_audio_tts.max_batch`, Qwen3 TTS via `qwen3_tts.max_batch`) the requests share one batched AR pass; other families run sequentially behind the same response shape.
+
+```bash
+curl http://127.0.0.1:8080/v1/audio/speech/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen",
+    "language": "German",
+    "seed": 42,
+    "items": [
+      {"input": "First sentence.", "speaker": "vivian"},
+      {"input": "Second sentence, cloned voice.", "voice_ref": "/path/to/reference.wav", "instructions": "Cheerful."}
+    ]
+  }'
+```
+
+Every top-level field except `items` and `model` is a per-item default; each item overrides key by key. The response is always JSON: `{"data": [{"index", "audio" (base64 WAV), "format", "sample_rate", "channels"} | {"index", "error": {"message"}}], "count", "failed", "timing"}`. A failed item carries its own error and does not affect the other items.
 
 ### `POST /v1/audio/transcriptions`
 

@@ -63,9 +63,9 @@ Qwen3 CustomVoice uses speaker ids packaged with the model. The CLI passes the s
 | Model directory | `models/Qwen3-TTS-12Hz-1.7B-CustomVoice` |
 | Task | `tts` |
 | Modes | `offline` |
-| Voice input | Built-in speaker id through `--speaker` |
+| Voice input | Built-in speaker id through `--speaker`, or a cloned voice through `--voice-ref` |
 | Style control | Optional instruction through `--instruct` |
-| External voice WAV | Not used by this path |
+| External voice WAV | `--voice-ref` clones a voice when the checkpoint ships the speaker encoder; combines freely with `--instruct` |
 
 ```bash
 audiocpp_cli --task tts --family qwen3_tts --model models/Qwen3-TTS-12Hz-1.7B-CustomVoice --backend cuda --text "Hello from a custom voice." --speaker Vivian --instruct "Very happy." --out out.wav
@@ -96,6 +96,35 @@ These sampling controls are shared by the Qwen3 TTS Base, VoiceDesign, and Custo
 | `--request-option subtalker_top_k=<n>` | integer | `50` | Subtalker top-k. |
 | `--request-option subtalker_top_p=<float>` | float | `1.0` | Subtalker top-p. |
 | `--seed` | integer | random if omitted | Sampling seed. |
+
+## Qwen3 TTS Batching
+
+All three TTS variants support batched offline generation: several requests
+decode through one batched AR pass, sharing the per-token weight read that
+makes single-sequence decode memory bandwidth bound. Long texts are chunked
+first and the chunk is the unit of batching, so a single long request submitted
+through the batch endpoint batches its own chunks. Both the main talker step
+and the per-frame code predictor run batched; prompts are prefilled per slot.
+The server exposes it through `POST /v1/audio/speech/batch`, the CLI through
+`--batch-text-file` (the CLI batches only when it carries more than one
+request).
+
+```bash
+audiocpp_cli --task tts --family qwen3_tts --model models/Qwen3-TTS-12Hz-1.7B-CustomVoice --backend cuda --session-option qwen3_tts.max_batch=5 --batch-text-file lines.txt --speaker Vivian --out-dir outputs --metrics
+```
+
+| Session option | Values | Default | Meaning |
+|---|---|---:|---|
+| `qwen3_tts.max_batch` | 1 to 8 | `1` | Requests decoded together. `1` keeps the single-sequence path. Values above 8 are clamped on CUDA with a logged warning: ggml's vector-matmul kernels cover a batch of at most 8, past that the fallback path is far slower than not batching. |
+
+Notes:
+
+- Batching raises **throughput, not per-request latency**. A single request is not faster.
+- Chunks are sorted by length internally; slots run in lockstep until the longest one finishes, so requests of similar length waste the least work.
+- A cloned voice (`--voice-ref`) runs the speaker encoder once per request; chunks reuse the embedding. Requests with different speakers, cloned voices, and instructions can share one batch.
+- VRAM grows with one talker KV cache per slot. The cache starts small and doubles on demand, so short requests do not pay for a large `--max-tokens`.
+- Batched matmuls reduce in a different order than the single-sequence path, so sampled output for a given seed is close to but not bit-identical with `max_batch=1`.
+- A request that reaches `--max-tokens` is truncated exactly like in the single path; a request whose prompt cannot be built fails alone without affecting its batch neighbours.
 
 ## Qwen3 ASR
 
