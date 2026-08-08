@@ -417,7 +417,16 @@ PromptEmbeddingState build_prompt_state(
 
     std::vector<float> custom_voice_speaker_embed;
     std::string language = ascii_lower(prefill.language);
-    if (prefill.prompt_mode == Qwen3TalkerPromptMode::CustomVoice) {
+    if (prefill.prompt_mode == Qwen3TalkerPromptMode::CustomVoice
+        && prefill.speaker_embedding.has_value()) {
+        // Eigene Stimme: das Embedding aus dem Referenz-Clip tritt an die Stelle
+        // der sonst nachgeschlagenen Sprecher-Zeile. Beide sind hidden_size gross
+        // und landen an derselben Prompt-Position.
+        if (prefill.speaker_embedding->dims != config.hidden_size) {
+            throw std::runtime_error("Qwen3 custom voice speaker embedding has wrong size");
+        }
+        custom_voice_speaker_embed = prefill.speaker_embedding->values;
+    } else if (prefill.prompt_mode == Qwen3TalkerPromptMode::CustomVoice) {
         const std::string speaker = ascii_lower(prefill.speaker);
         const auto speaker_it = config.speaker_id.find(speaker);
         if (speaker_it == config.speaker_id.end()) {

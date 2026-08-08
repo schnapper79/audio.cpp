@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -308,11 +309,30 @@ Qwen3TTSSession::Qwen3TTSSession(
             speech_encoder_weight_storage_type_,
             conv_weight_storage_type_,
             perf_mode_);
-        speaker_encoder_ = std::make_unique<Qwen3SpeakerEncoderRuntime>(
-            assets_,
-            voice_prompt_context_,
-            speaker_encoder_graph_arena_bytes_,
-            conv_weight_storage_type_);
+    }
+    if (assets_->config.variant == Qwen3TTSVariant::Base
+        || assets_->config.variant == Qwen3TTSVariant::CustomVoice) {
+        // CustomVoice-Checkpoints bringen den Sprecher-Encoder normalerweise
+        // nicht mit. Fehlt er, bleibt der Zeiger leer und nur das Klonen einer
+        // eigenen Stimme entfaellt - die mitgelieferten Sprecher gehen weiter.
+        try {
+            speaker_encoder_ = std::make_unique<Qwen3SpeakerEncoderRuntime>(
+                assets_,
+                voice_prompt_context_,
+                speaker_encoder_graph_arena_bytes_,
+                conv_weight_storage_type_);
+        } catch (const std::exception & ex) {
+            if (assets_->config.variant == Qwen3TTSVariant::Base) {
+                throw;
+            }
+            // Grund sichtbar machen: sonst sieht ein fehlender Encoder genauso
+            // aus wie ein falsch benannter oder unvollstaendig kopierter.
+            std::fprintf(
+                stderr,
+                "[qwen3_tts] speaker encoder unavailable for custom voice: %s\n",
+                ex.what());
+            speaker_encoder_.reset();
+        }
     }
 }
 
@@ -387,6 +407,7 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
     if (assets_->config.variant == Qwen3TTSVariant::CustomVoice) {
         Qwen3TTSCustomVoicePromptBuilder prompt_builder(
             text_tokenizer_,
+            speaker_encoder_.get(),
             assets_->config.talker.max_position_embeddings,
             assets_->config.talker.max_position_embeddings);
         double prefill_ms = 0.0;
@@ -398,6 +419,24 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
             const auto prefill_start = Clock::now();
             const auto prefill = prompt_builder.build_prefill(qwen_request);
             prefill_ms += engine::debug::elapsed_ms(prefill_start, Clock::now());
+            // Sprecher-Embedding auf Wunsch herausschreiben - dasselbe Ventil
+            // wie im Base-Klonpfad, damit ein CustomVoice-Setup ohne geladenes
+            // Base-Modell auskommt.
+            if (const auto path = runtime::find_option(
+                    chunk_request.options,
+                    {"speaker_embedding_out"})) {
+                if (!prefill.speaker_embedding.has_value()) {
+                    throw std::runtime_error(
+                        "speaker_embedding_out requires reference audio (voice_ref)");
+                }
+                std::FILE * emb_out = std::fopen(path->c_str(), "wb");
+                if (emb_out == nullptr) {
+                    throw std::runtime_error("cannot write speaker_embedding_out: " + *path);
+                }
+                const auto & emb_values = prefill.speaker_embedding->values;
+                std::fwrite(emb_values.data(), sizeof(float), emb_values.size(), emb_out);
+                std::fclose(emb_out);
+            }
             const auto talker_start = Clock::now();
             const auto codes = talker_step_->generate(
                 prefill,
@@ -440,6 +479,20 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         const Qwen3TTSRequest qwen_request = make_request(chunk_request);
         const auto prompt_start = Clock::now();
         const auto & voice_prompt = resolve_voice_prompt(*qwen_request.voice_clone, prompt_builder);
+        // Sprecher-Embedding auf Wunsch herausschreiben. Es entsteht hier
+        // ohnehin; ohne diesen Ausgang gaebe es keinen Weg, den Vektor einer
+        // Stimme aufzubewahren - CustomVoice erwartet genau ihn.
+        if (const auto path = runtime::find_option(
+                chunk_request.options,
+                {"speaker_embedding_out"})) {
+            std::FILE * out = std::fopen(path->c_str(), "wb");
+            if (out == nullptr) {
+                throw std::runtime_error("cannot write speaker_embedding_out: " + *path);
+            }
+            const auto & values = voice_prompt.speaker_embedding.values;
+            std::fwrite(values.data(), sizeof(float), values.size(), out);
+            std::fclose(out);
+        }
         prompt_ms += engine::debug::elapsed_ms(prompt_start, Clock::now());
         const auto prefill_start = Clock::now();
         const auto prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
@@ -578,6 +631,10 @@ Qwen3TTSRequest Qwen3TTSSession::make_request(const runtime::TaskRequest & reque
         custom_voice.speaker = runtime::find_option(request.options, {"speaker"}).value_or("");
         if (custom_voice.speaker.empty() && request.voice.has_value() && request.voice->speaker.has_value()) {
             custom_voice.speaker = request.voice->speaker->cached_voice_id.value_or("");
+        }
+        if (request.voice.has_value() && request.voice->speaker.has_value()
+            && request.voice->speaker->audio.has_value()) {
+            custom_voice.reference_audio = *request.voice->speaker->audio;
         }
         custom_voice.instruct = runtime::find_option(
             request.options,

@@ -52,6 +52,10 @@ struct Qwen3VoiceDesignInput {
 struct Qwen3CustomVoiceInput {
     std::string speaker;
     std::string instruct;
+    // Statt eines mitgelieferten Sprechers ein eigener Referenz-Clip. Das
+    // Sprecher-Embedding daraus landet an derselben Prompt-Position wie sonst
+    // die nachgeschlagene Zeile der Codec-Embedding-Matrix.
+    std::optional<runtime::AudioBuffer> reference_audio = std::nullopt;
 };
 
 struct Qwen3TTSRequest {

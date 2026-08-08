@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/models/qwen3_tts/talker.h"
+#include "engine/models/qwen3_tts/speaker_encoder.h"
 #include "engine/models/qwen3_tts/tokenizer_text.h"
 #include "engine/models/qwen3_tts/types.h"
 
@@ -10,6 +11,7 @@ class Qwen3TTSCustomVoicePromptBuilder {
 public:
     Qwen3TTSCustomVoicePromptBuilder(
         const Qwen3TextTokenizer & tokenizer,
+        const Qwen3SpeakerEncoderRuntime * speaker_encoder,
         int64_t text_token_limit,
         int64_t instruction_token_limit);
 
@@ -17,6 +19,7 @@ public:
 
 private:
     const Qwen3TextTokenizer & tokenizer_;
+    const Qwen3SpeakerEncoderRuntime * speaker_encoder_ = nullptr;
     int64_t text_token_limit_ = 0;
     int64_t instruction_token_limit_ = 0;
 };
