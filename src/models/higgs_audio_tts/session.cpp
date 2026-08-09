@@ -91,6 +91,176 @@ int64_t resolve_max_batch_size(const runtime::SessionOptions & options) {
     return size;
 }
 
+bool resolve_tail_cleanup(const runtime::SessionOptions & options) {
+    if (const auto value = runtime::find_option(
+            options.options,
+            {"higgs_audio_tts.tail_cleanup", "tail_cleanup"})) {
+        return runtime::parse_bool_option(*value, "higgs_audio_tts.tail_cleanup");
+    }
+    return true;
+}
+
+int64_t resolve_tail_cleanup_fade_ms(const runtime::SessionOptions & options) {
+    const int64_t fade_ms = runtime::parse_i64_option(
+        options.options,
+        {"higgs_audio_tts.tail_cleanup_fade_ms"})
+        .value_or(80);
+    if (fade_ms < 0 || fade_ms > 500) {
+        throw std::runtime_error("higgs_audio_tts.tail_cleanup_fade_ms must be in [0, 500]");
+    }
+    return fade_ms;
+}
+
+// The model sometimes emits a breath-like noise burst after the last word and
+// before end-of-audio: speech decays, then an unvoiced high-frequency burst
+// RISES again for a few codec frames, then silence. A legitimate word ending -
+// including a final fricative - decays monotonically, so an energy rise after
+// the last voiced window is the discriminator. The burst and everything after
+// it are cut, a short fade and a natural pause are kept.
+void trim_trailing_noise_burst(runtime::AudioBuffer & audio, int64_t fade_ms) {
+    if (audio.sample_rate <= 0 || audio.channels != 1 || audio.samples.size() < 4096) {
+        return;
+    }
+    const int sr = audio.sample_rate;
+    const int win = sr / 50;   // 20 ms
+    const int hop = sr / 100;  // 10 ms
+    const int64_t total = static_cast<int64_t>(audio.samples.size());
+    // Only the final stretch of the chunk is examined.
+    const int64_t analysis_start = std::max<int64_t>(0, total - static_cast<int64_t>(sr) * 3 / 2);
+    struct Window {
+        int64_t start = 0;
+        float rms = 0.0F;
+        float zcr = 0.0F;
+        bool voiced = false;
+    };
+    std::vector<Window> windows;
+    const int lag_min = sr / 400;
+    const int lag_max = sr / 60;
+    for (int64_t start = analysis_start; start + win <= total; start += hop) {
+        Window w;
+        w.start = start;
+        double energy = 0.0;
+        int crossings = 0;
+        for (int i = 0; i < win; ++i) {
+            const float s = audio.samples[static_cast<size_t>(start + i)];
+            energy += static_cast<double>(s) * s;
+            if (i > 0 && (s >= 0.0F) != (audio.samples[static_cast<size_t>(start + i - 1)] >= 0.0F)) {
+                ++crossings;
+            }
+        }
+        w.rms = static_cast<float>(std::sqrt(energy / win));
+        w.zcr = static_cast<float>(crossings) / static_cast<float>(win);
+        if (w.rms > 0.008F) {
+            // Autocorrelation peak in the speech F0 range marks voicing.
+            double mean = 0.0;
+            for (int i = 0; i < win; ++i) {
+                mean += audio.samples[static_cast<size_t>(start + i)];
+            }
+            mean /= win;
+            double norm = 0.0;
+            for (int i = 0; i < win; ++i) {
+                const double v = audio.samples[static_cast<size_t>(start + i)] - mean;
+                norm += v * v;
+            }
+            if (norm > 0.0) {
+                double best = 0.0;
+                for (int lag = lag_min; lag < lag_max && lag < win; ++lag) {
+                    double acc = 0.0;
+                    for (int i = 0; i + lag < win; ++i) {
+                        const double a = audio.samples[static_cast<size_t>(start + i)] - mean;
+                        const double b = audio.samples[static_cast<size_t>(start + i + lag)] - mean;
+                        acc += a * b;
+                    }
+                    best = std::max(best, acc / norm);
+                }
+                w.voiced = best > 0.4;
+            }
+        }
+        windows.push_back(w);
+    }
+    // Last voiced window inside the analysis span.
+    int64_t last_voiced = -1;
+    for (int64_t index = static_cast<int64_t>(windows.size()) - 1; index >= 0; --index) {
+        if (windows[static_cast<size_t>(index)].voiced) {
+            last_voiced = index;
+            break;
+        }
+    }
+    if (last_voiced < 0) {
+        return;
+    }
+    // The unvoiced tail after the last voiced window may only decay. Two burst
+    // signatures are cut: a sharp energy rise over the tracked envelope, and a
+    // high-zero-crossing noise segment whose energy peaks after its own onset
+    // or above the final speech level - a legitimate word-final fricative
+    // starts at its loudest and decays, it never peaks later. The noise-segment
+    // rule additionally requires the voice to have faded already: a real
+    // final fricative attaches to full-level speech, the artifact only appears
+    // once the voice has decayed toward silence.
+    float speech_rms = 0.0F;
+    {
+        std::vector<float> voiced_rms;
+        for (const auto & w : windows) {
+            if (w.voiced) {
+                voiced_rms.push_back(w.rms);
+            }
+        }
+        if (voiced_rms.size() < 3) {
+            return;
+        }
+        std::nth_element(voiced_rms.begin(), voiced_rms.begin() + voiced_rms.size() / 2, voiced_rms.end());
+        speech_rms = voiced_rms[voiced_rms.size() / 2];
+    }
+    const float last_voiced_rms = windows[static_cast<size_t>(last_voiced)].rms;
+    const bool voice_faded = last_voiced_rms < speech_rms * 0.4F;
+    float envelope = last_voiced_rms;
+    int64_t cut_window = -1;
+    int64_t noise_onset = -1;
+    float noise_onset_rms = 0.0F;
+    float noise_peak_rms = 0.0F;
+    for (int64_t index = last_voiced + 1; index < static_cast<int64_t>(windows.size()); ++index) {
+        const auto & w = windows[static_cast<size_t>(index)];
+        if (w.rms > envelope * 1.5F && w.rms > 0.006F) {
+            cut_window = noise_onset >= 0 ? noise_onset : index;
+            break;
+        }
+        envelope = std::max(w.rms, envelope * 0.85F);
+        if (noise_onset < 0) {
+            if (w.zcr > 0.3F && w.rms > 0.004F) {
+                noise_onset = index;
+                noise_onset_rms = w.rms;
+                noise_peak_rms = w.rms;
+            }
+        } else if (w.zcr > 0.3F) {
+            noise_peak_rms = std::max(noise_peak_rms, w.rms);
+        }
+    }
+    if (cut_window < 0 && noise_onset >= 0 && voice_faded &&
+        (noise_peak_rms > noise_onset_rms * 1.25F || noise_peak_rms > last_voiced_rms * 1.2F) &&
+        noise_peak_rms > 0.006F) {
+        cut_window = noise_onset;
+    }
+    if (cut_window < 0) {
+        return;
+    }
+    // Fade out over the first fade_ms of the cut region instead of cutting
+    // hard at its start: when a word-final fricative and the artifact are
+    // fused, a hard cut would delete the fricative; the fade keeps it audible
+    // as a short decaying /s/ while a pure noise burst shrinks from hundreds
+    // of milliseconds to a quiet puff. fade_ms 0 restores the hard cut.
+    const int64_t fade_begin = windows[static_cast<size_t>(cut_window)].start;
+    const int64_t fade_len = std::min<int64_t>(std::max<int64_t>(sr * fade_ms / 1000, sr / 100), total - fade_begin);
+    const int64_t cut_sample = fade_begin + fade_len;
+    debug::trace_log_scalar("higgs_audio_tts.tail_cleanup.trimmed_ms",
+                            (total - cut_sample) * 1000 / sr);
+    for (int64_t i = fade_begin; i < cut_sample; ++i) {
+        const float gain = static_cast<float>(cut_sample - i) / static_cast<float>(fade_len);
+        audio.samples[static_cast<size_t>(i)] *= gain;
+    }
+    audio.samples.resize(static_cast<size_t>(cut_sample));
+    audio.samples.insert(audio.samples.end(), static_cast<size_t>(sr / 8), 0.0F);
+}
+
 const runtime::AudioBuffer * find_reference_audio(const runtime::TaskRequest & request) {
     if (request.voice.has_value()
         && request.voice->speaker.has_value()
@@ -154,7 +324,9 @@ HiggsTTSSession::HiggsTTSSession(
       task_(task),
       assets_(std::move(assets)),
       reference_cache_(resolve_reference_cache_slots(this->options())),
-      max_batch_size_(resolve_max_batch_size(this->options())) {
+      max_batch_size_(resolve_max_batch_size(this->options())),
+      tail_cleanup_(resolve_tail_cleanup(this->options())),
+      tail_cleanup_fade_ms_(resolve_tail_cleanup_fade_ms(this->options())) {
     if (assets_ == nullptr) {
         throw std::runtime_error("Higgs TTS session requires assets");
     }
@@ -198,6 +370,8 @@ HiggsTTSSession::HiggsTTSSession(
             key != "higgs_audio_tts.codec_encode_graph_arena_mb" &&
             key != "higgs_audio_tts.reference_cache_slots" &&
             key != "higgs_audio_tts.max_batch" &&
+            key != "higgs_audio_tts.tail_cleanup" &&
+            key != "higgs_audio_tts.tail_cleanup_fade_ms" &&
             key != "higgs_audio_tts.weight_type" &&
             key != "higgs_audio_tts.ar_weight_type" &&
             key != "higgs_audio_tts.codec_weight_type") {
@@ -279,11 +453,15 @@ runtime::TaskResult HiggsTTSSession::run(const runtime::TaskRequest & request) {
     for (const auto & chunk_request : chunk_requests) {
         const auto generation_request = make_generation_request(chunk_request, reference_codes);
         auto result = generator_->generate(generation_request);
-        runtime::append_audio_buffer(merged_audio, runtime::AudioBuffer{
+        runtime::AudioBuffer chunk_audio{
             result.audio.sample_rate,
             result.audio.channels,
             std::move(result.audio.values),
-        });
+        };
+        if (tail_cleanup_) {
+            trim_trailing_noise_burst(chunk_audio, tail_cleanup_fade_ms_);
+        }
+        runtime::append_audio_buffer(merged_audio, std::move(chunk_audio));
     }
 
     runtime::TaskResult out;
@@ -427,11 +605,15 @@ std::vector<runtime::BatchedTaskResult> HiggsTTSSession::run_batch(
                 }
                 continue;
             }
-            chunk_audio[item.request_index][item.chunk_index] = runtime::AudioBuffer{
+            runtime::AudioBuffer slot_audio{
                 result.audio.sample_rate,
                 result.audio.channels,
                 std::move(result.audio.values),
             };
+            if (tail_cleanup_) {
+                trim_trailing_noise_burst(slot_audio, tail_cleanup_fade_ms_);
+            }
+            chunk_audio[item.request_index][item.chunk_index] = std::move(slot_audio);
         }
     }
 

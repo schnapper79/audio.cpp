@@ -77,6 +77,10 @@ private:
     std::unique_ptr<HiggsGenerator> generator_;
     runtime::CacheSlots<ReferenceCacheKey, ReferenceCacheEntry, ReferenceCacheKeyEqual> reference_cache_;
     int64_t max_batch_size_ = 1;
+    // Trim the breath-like noise burst the model sometimes emits between the
+    // last word and end-of-audio; see trim_trailing_noise_burst.
+    bool tail_cleanup_ = true;
+    int64_t tail_cleanup_fade_ms_ = 80;
     std::optional<ReferenceCacheEntry> uncached_reference_;
 };
 
