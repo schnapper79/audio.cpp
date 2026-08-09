@@ -43,7 +43,7 @@ runtime::ModelCliInterface cli(const HiggsAssets &) {
         {"top_p", "float", "AR nucleus sampling probability."},
         {"repetition_penalty", "float", "Accepted for Python API compatibility; Higgs audio sampling does not consume it."},
         {"seed", "n", "Torch RNG seed."},
-        {"text_chunk_size", "n", "Long-form text chunk size; default 1024."},
+        {"text_chunk_size", "n", "Long-form text chunk size; default 512. Larger chunks silently drop or repeat content."},
         {"text_chunk_mode", "default|tag_aware|japanese|endline", "Framework text chunking mode."},
     };
     out.session_options = {
@@ -56,6 +56,7 @@ runtime::ModelCliInterface cli(const HiggsAssets &) {
         {"higgs_audio_tts.codec_decode_graph_arena_mb", "n", "Codec decode graph arena size."},
         {"higgs_audio_tts.codec_encode_graph_arena_mb", "n", "Codec encode graph arena size."},
         {"higgs_audio_tts.reference_cache_slots", "n", "Encoded reference-audio cache slots; default 1."},
+        {"higgs_audio_tts.max_batch", "n", "Maximum requests decoded together in one batched AR pass; default 1, capped at 8 on CUDA."},
     };
     return out;
 }

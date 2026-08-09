@@ -433,7 +433,7 @@ python3 tools/model_manager_v2.py install --models-root models higgs_audio_tts_4
 |---|---|---:|---|
 | `--voice-ref` | WAV path | required | Reference speaker audio. |
 | `--reference-text` | text | empty string | Transcript for reference audio. |
-| `--text-chunk-size` | integer chars | `1024` | Long-form chunk size. |
+| `--text-chunk-size` | integer chars | `512` | Long-form chunk size. Above ~512 the model silently drops or repeats content on long text (measured: 768 loses ~10% of the words, 1024 loses 14-27% across seeds), so stay at or below the default. |
 | `--max-tokens` | integer | `2048` | Maximum generated AR tokens per chunk. |
 | `--temperature` | float | `0.8` | AR sampling temperature. |
 | `--top-k` | integer | `30` | AR top-k sampling limit. The narrower default is less prone to premature EOC than the Python client's `50`. |

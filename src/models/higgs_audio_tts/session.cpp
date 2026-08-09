@@ -17,7 +17,13 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr int64_t kDefaultTextChunkSize = 1024;
+// Measured on the v3 4B Q8 checkpoint (long-form English, ASR-verified word
+// accuracy across seeds): chunks up to 512 characters generate the full text
+// (WER <= 2%); at 768 the model reliably drops ~10% of the words, and at 1024
+// every seed either skips whole sentences or rambles (WER 14-27%). The failure
+// is silent - audio sounds fine, content is just missing - so the default
+// stays below the cliff.
+constexpr int64_t kDefaultTextChunkSize = 512;
 constexpr int64_t kDefaultReferenceCacheSlots = 1;
 constexpr int64_t kDefaultMaxBatchSize = 1;
 

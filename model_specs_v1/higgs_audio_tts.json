@@ -78,10 +78,10 @@
       {
         "name": "text_chunk_size",
         "type": "int",
-        "description": "Maximum characters per generated text chunk; default 1024.",
+        "description": "Maximum characters per generated text chunk; default 512. Above ~512 the model silently drops or repeats content on long-form text (measured: 768 loses ~10% of words, 1024 loses 14-27% across seeds).",
         "required": false,
         "min": 1,
-        "default": 1024
+        "default": 512
       },
       {
         "name": "text_chunk_mode",

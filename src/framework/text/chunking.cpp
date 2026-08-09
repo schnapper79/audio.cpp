@@ -569,7 +569,9 @@ std::optional<TextChunkMode> parse_text_chunk_mode_override(
         return std::nullopt;
     }
     const std::string & value = match->value;
-    if (value == "default") {
+    // "word_budget" is the name the model-spec preset documents for the
+    // default mode; accept it so a value copied from spec output parses.
+    if (value == "default" || value == "word_budget") {
         return TextChunkMode::Default;
     }
     if (value == "tag_aware" || value == "tag-aware" || value == "tagaware") {
