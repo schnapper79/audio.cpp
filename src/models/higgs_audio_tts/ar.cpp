@@ -12,6 +12,7 @@
 #include "engine/framework/modules/primitive_modules.h"
 #include "engine/framework/modules/structural_modules.h"
 
+#include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml.h>
 
@@ -22,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -36,6 +38,14 @@ struct GgmlContextDeleter {
     void operator()(ggml_context * ctx) const noexcept {
         if (ctx != nullptr) {
             ggml_free(ctx);
+        }
+    }
+};
+
+struct GgmlGallocrDeleter {
+    void operator()(ggml_gallocr_t alloc) const noexcept {
+        if (alloc != nullptr) {
+            ggml_gallocr_free(alloc);
         }
     }
 };
@@ -913,6 +923,14 @@ struct HiggsARBatchPrefillGraph::Impl {
             ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, config.audio.num_codebooks, run_steps);
         text_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, run_steps, 1);
         code_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, run_steps, 1);
+        // Input-Markierungen fuer den Graph-Allocator unten. Das Flag sorgt
+        // fuer die Vorab-Allokation; Bestand ueber einen Compute hinaus
+        // garantiert es NICHT - run() laedt deshalb vor jedem Compute alle
+        // Eingaben neu hoch, und dabei muss es bleiben.
+        ggml_set_input(text_tokens);
+        ggml_set_input(fused_code_ids);
+        ggml_set_input(text_gate);
+        ggml_set_input(code_gate);
         auto x = build_higgs_prefill_input_embedding(
             build_ctx,
             tensor_weights,
@@ -923,10 +941,12 @@ struct HiggsARBatchPrefillGraph::Impl {
             code_gate,
             run_steps);
         positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, run_steps);
+        ggml_set_input(positions);
         auto positions_value =
             core::wrap_tensor(positions, core::TensorShape::from_dims({run_steps}), GGML_TYPE_I32);
         attention_mask =
             ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, prompt_steps, run_steps, 1, 1);
+        ggml_set_input(attention_mask);
         auto attention_mask_value = core::wrap_tensor(
             attention_mask,
             core::TensorShape::from_dims({1, 1, run_steps, prompt_steps}),
@@ -990,12 +1010,22 @@ struct HiggsARBatchPrefillGraph::Impl {
         x = modules::RMSNormModule({config.text.hidden_size, config.text.rms_norm_eps, true, false})
                 .build(build_ctx, x, {tensor_weights.norm, std::nullopt});
         auto logits = build_modality_logits(build_ctx, x, tensor_weights, config);
-        logits_output = logits.tensor;
+        // build_modality_logits liefert eine reshape-View; das OUTPUT-Flag
+        // allein wuerde nur die View schuetzen, nicht ihren view_src. Heute
+        // waere das zufaellig korrekt (nichts folgt auf die Logits), aber ein
+        // kopierter echter Tensor macht den Schutz explizit statt topologisch.
+        logits_output = ggml_cont(ctx.get(), logits.tensor);
         ggml_set_output(logits_output);
         ggml_build_forward_expand(graph, logits_output);
 
-        buffer = ggml_backend_alloc_ctx_tensors(ctx.get(), runtime->backend());
-        if (buffer == nullptr) {
+        // Kein ggml_backend_alloc_ctx_tensors: das materialisiert JEDEN
+        // Zwischentensor aller Layer gleichzeitig - gemessen ~12.5 MB je
+        // Prompt-Step, also 6-8 GB fuer einen gewoehnlichen Prompt, und war
+        // die Ursache der Produktions-OOMs, sobald mehrere Modelle geladen
+        // waren. Der Graph-Allocator plant die Puffer entlang der
+        // Tensor-Lebensdauern und kommt mit einem Bruchteil aus.
+        galloc.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(runtime->backend())));
+        if (galloc == nullptr || !ggml_gallocr_alloc_graph(galloc.get(), graph)) {
             throw std::runtime_error("failed to allocate Higgs TTS AR batch prefill graph");
         }
         // Positions are shifted by the left padding so that every slot's first
@@ -1009,9 +1039,6 @@ struct HiggsARBatchPrefillGraph::Impl {
 
     ~Impl() {
         engine::core::release_backend_graph_resources(runtime->backend(), graph);
-        if (buffer != nullptr) {
-            ggml_backend_buffer_free(buffer);
-        }
     }
 
     HiggsARDecodeOutput run(const HiggsARPrefillInput & input) {
@@ -1083,7 +1110,7 @@ struct HiggsARBatchPrefillGraph::Impl {
     std::vector<int32_t> positions_values;
     std::vector<ggml_fp16_t> attention_mask_values;
     ggml_cgraph * graph = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
+    std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, GgmlGallocrDeleter> galloc;
 };
 
 HiggsARBatchPrefillGraph::HiggsARBatchPrefillGraph(
@@ -1417,7 +1444,11 @@ struct HiggsARDecodeGraph::Impl {
         x = modules::RMSNormModule({config.text.hidden_size, config.text.rms_norm_eps, true, false})
                 .build(build_ctx, x, {tensor_weights.norm, std::nullopt});
         auto logits = build_modality_logits(build_ctx, x, tensor_weights, config);
-        logits_output = logits.tensor;
+        // build_modality_logits liefert eine reshape-View; das OUTPUT-Flag
+        // allein wuerde nur die View schuetzen, nicht ihren view_src. Heute
+        // waere das zufaellig korrekt (nichts folgt auf die Logits), aber ein
+        // kopierter echter Tensor macht den Schutz explizit statt topologisch.
+        logits_output = ggml_cont(ctx.get(), logits.tensor);
         ggml_set_output(logits_output);
         ggml_build_forward_expand(graph, logits_output);
 
@@ -1624,6 +1655,12 @@ struct HiggsARPrefillGraph::Impl {
         fused_code_ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, config.audio.num_codebooks, run_steps);
         text_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, run_steps, 1);
         code_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, run_steps, 1);
+        // Input-Markierungen fuer den Graph-Allocator, wie im Batch-Prefill
+        // (Vorab-Allokation; run() laedt vor jedem Compute neu hoch).
+        ggml_set_input(text_tokens);
+        ggml_set_input(fused_code_ids);
+        ggml_set_input(text_gate);
+        ggml_set_input(code_gate);
         auto x = build_higgs_prefill_input_embedding(
             build_ctx,
             tensor_weights,
@@ -1634,9 +1671,11 @@ struct HiggsARPrefillGraph::Impl {
             code_gate,
             run_steps);
         positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, run_steps);
+        ggml_set_input(positions);
         auto positions_value =
             core::wrap_tensor(positions, core::TensorShape::from_dims({run_steps}), GGML_TYPE_I32);
         attention_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, prefill_cache_steps, run_steps, 1, 1);
+        ggml_set_input(attention_mask);
         auto attention_mask_value = core::wrap_tensor(
             attention_mask,
             core::TensorShape::from_dims({1, 1, run_steps, prefill_cache_steps}),
@@ -1691,20 +1730,39 @@ struct HiggsARPrefillGraph::Impl {
                 ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), out.key.tensor, key_dest.tensor));
                 ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), out.value.tensor, value_dest.tensor));
             } else {
-                keys.push_back(out.key.tensor);
-                values.push_back(out.value.tensor);
+                // Ohne Ziel-Cache liest run() die K/V NACH dem Compute aus.
+                // out.key/out.value koennen Views sein, und das OUTPUT-Flag
+                // schuetzt beim Graph-Allocator nur den markierten Tensor
+                // selbst, nicht seinen view_src - der wuerde nach dem
+                // Attention-Konsum freigegeben und fuer spaetere Layer
+                // recycelt. Deshalb erst in eigene Tensoren kopieren und DIE
+                // markieren; die Byte-Reihenfolge bleibt identisch.
+                ggml_tensor * key_out = ggml_cont(ctx.get(), out.key.tensor);
+                ggml_tensor * value_out = ggml_cont(ctx.get(), out.value.tensor);
+                ggml_set_output(key_out);
+                ggml_set_output(value_out);
+                ggml_build_forward_expand(graph, key_out);
+                ggml_build_forward_expand(graph, value_out);
+                keys.push_back(key_out);
+                values.push_back(value_out);
             }
         }
         x = modules::SliceModule({1, run_steps - 1, 1}).build(build_ctx, x);
         x = modules::RMSNormModule({config.text.hidden_size, config.text.rms_norm_eps, true, false})
                 .build(build_ctx, x, {tensor_weights.norm, std::nullopt});
         auto logits = build_modality_logits(build_ctx, x, tensor_weights, config);
-        logits_output = logits.tensor;
+        // build_modality_logits liefert eine reshape-View; das OUTPUT-Flag
+        // allein wuerde nur die View schuetzen, nicht ihren view_src. Heute
+        // waere das zufaellig korrekt (nichts folgt auf die Logits), aber ein
+        // kopierter echter Tensor macht den Schutz explizit statt topologisch.
+        logits_output = ggml_cont(ctx.get(), logits.tensor);
         ggml_set_output(logits_output);
         ggml_build_forward_expand(graph, logits_output);
 
-        buffer = ggml_backend_alloc_ctx_tensors(ctx.get(), runtime->backend());
-        if (buffer == nullptr) {
+        // Graph-Allocator statt Voll-Materialisierung - Begruendung siehe
+        // Batch-Prefill oben (12.5 MB je Prompt-Step -> Produktions-OOMs).
+        galloc.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(runtime->backend())));
+        if (galloc == nullptr || !ggml_gallocr_alloc_graph(galloc.get(), graph)) {
             throw std::runtime_error("failed to allocate Higgs TTS AR prefill graph");
         }
         text_token_values.assign(static_cast<size_t>(run_steps), 0);
@@ -1720,9 +1778,6 @@ struct HiggsARPrefillGraph::Impl {
 
     ~Impl() {
         engine::core::release_backend_graph_resources(runtime->backend(), graph);
-        if (buffer != nullptr) {
-            ggml_backend_buffer_free(buffer);
-        }
     }
 
     bool matches(
@@ -2102,7 +2157,7 @@ struct HiggsARPrefillGraph::Impl {
     std::vector<int32_t> positions_values;
     std::vector<ggml_fp16_t> attention_mask_values;
     ggml_cgraph * graph = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
+    std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, GgmlGallocrDeleter> galloc;
 };
 
 HiggsARPrefillGraph::HiggsARPrefillGraph(
