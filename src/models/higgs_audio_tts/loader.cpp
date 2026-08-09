@@ -57,6 +57,8 @@ runtime::ModelCliInterface cli(const HiggsAssets &) {
         {"higgs_audio_tts.codec_encode_graph_arena_mb", "n", "Codec encode graph arena size."},
         {"higgs_audio_tts.reference_cache_slots", "n", "Encoded reference-audio cache slots; default 1."},
         {"higgs_audio_tts.max_batch", "n", "Maximum requests decoded together in one batched AR pass; default 1, capped at 8 on CUDA."},
+        {"higgs_audio_tts.tail_cleanup", "true|false", "Trim trailing breath-noise bursts after the last word; default true."},
+        {"higgs_audio_tts.tail_cleanup_fade_ms", "n", "Fade-out kept from a detected trailing burst; default 80, 0 cuts hard."},
     };
     return out;
 }
