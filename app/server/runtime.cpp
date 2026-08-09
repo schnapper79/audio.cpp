@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -677,6 +678,11 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     else if (request.method == "POST" && request.path == "/v1/audio/speech/batch") {
         response = handle_speech_batch(request.body);
     }
+    // Voice-embedding extraction: WAV in, mixable vector out; the speech
+    // endpoint accepts the (possibly mixed) vector back as "speaker_embedding".
+    else if (request.method == "POST" && request.path == "/v1/audio/voices/embedding") {
+        response = handle_voice_embedding(request);
+    }
     else if (request.method == "POST" && request.path == "/v1/audio/transcriptions") {
         response = handle_transcription(request);
     }
@@ -879,6 +885,20 @@ engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel
     // CLI's --speaker. "voice" also reaches the same place via cached_voice_id,
     // but only when it does not name a configured voice preset.
     add_option_from_json(request.options, body, "speaker", "speaker");
+    // An inline speaker-embedding vector, as returned by
+    // /v1/audio/voices/embedding - clients may mix vectors before sending.
+    std::optional<std::vector<float>> speech_inline_embedding;
+    if (const auto * value = body.find("speaker_embedding")) {
+        if (!value->is_array() || value->as_array().empty()) {
+            throw std::runtime_error("speaker_embedding must be a non-empty array of numbers");
+        }
+        std::vector<float> values;
+        values.reserve(value->as_array().size());
+        for (const auto & entry : value->as_array()) {
+            values.push_back(static_cast<float>(entry.as_number()));
+        }
+        speech_inline_embedding = std::move(values);
+    }
 
     bool voice_field_is_preset = false;
     const auto * preset = select_voice_preset(model, body, voice_field_is_preset);
@@ -918,6 +938,13 @@ engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel
     }
     if (const auto * value = body.find("reference_text")) {
         request.options["reference_text"] = value->as_string();
+    }
+    if (speech_inline_embedding.has_value()) {
+        if (!voice.speaker.has_value()) {
+            voice.speaker = engine::runtime::VoiceReference{};
+        }
+        voice.speaker->embedding = std::move(speech_inline_embedding);
+        has_voice = true;
     }
     if (has_voice) {
         request.voice = std::move(voice);
@@ -1249,6 +1276,96 @@ HttpResponse ServerState::handle_speech_stream(
             throw std::runtime_error("streaming speech model produced no audio delta events");
         }
     });
+}
+
+// Extracts a speaker-embedding vector from reference audio without running a
+// generation. Accepts JSON ({"model", "voice_ref": <server path>}) or the same
+// multipart shape as transcription (model + file upload). The session resolves
+// the voice exactly as a speech request would - including the embedding cache -
+// and writes the vector to a temp file this handler returns as JSON. Clients
+// mix vectors as they like and send the result back inline as
+// "speaker_embedding" on a speech request.
+HttpResponse ServerState::handle_voice_embedding(const HttpRequest & request) {
+    std::string content_type;
+    if (const auto it = request.headers.find("content-type"); it != request.headers.end()) {
+        content_type = it->second;
+    }
+    std::string model_id;
+    engine::runtime::AudioBuffer audio;
+    if (const auto boundary = extract_multipart_boundary(content_type)) {
+        const auto parts = parse_multipart_body(request.body, *boundary);
+        log_multipart_request_summary_if_enabled(config_, parts);
+        const MultipartPart * file_part = nullptr;
+        for (const auto & part : parts) {
+            if (part.name == "file") {
+                file_part = &part;
+            } else if (part.name == "model") {
+                model_id = part.data;
+            }
+        }
+        if (file_part == nullptr || file_part->data.empty()) {
+            throw std::runtime_error("voice embedding request requires a non-empty 'file' field");
+        }
+        if (!is_wav_upload_filename(file_part->filename)) {
+            return error_response(
+                400,
+                "only WAV audio uploads are currently supported for voice embeddings",
+                "invalid_request_error");
+        }
+        audio = minitts::cli::read_audio_buffer(std::string_view(file_part->data));
+    } else {
+        const auto body = engine::io::json::parse(request.body);
+        model_id = engine::io::json::require_string(body, "model");
+        const auto voice_ref = engine::io::json::require_string(body, "voice_ref");
+        audio = minitts::cli::read_audio_buffer(resolve_path(request_base_, voice_ref));
+    }
+    if (model_id.empty()) {
+        throw std::runtime_error("voice embedding request requires a 'model' field");
+    }
+    const auto index_it = model_index_.find(model_id);
+    if (index_it == model_index_.end()) {
+        throw std::runtime_error("unknown model id: " + model_id);
+    }
+    auto & model = *models_.at(index_it->second);
+
+    static std::atomic<uint64_t> tmp_counter{0};
+    const auto tmp_path = std::filesystem::temp_directory_path() /
+        ("audiocpp_embedding_" + std::to_string(tmp_counter.fetch_add(1)) + ".emb");
+    engine::runtime::TaskRequest task;
+    task.text_input = engine::runtime::Transcript{"x", ""};
+    engine::runtime::VoiceCondition voice;
+    voice.speaker = engine::runtime::VoiceReference{};
+    voice.speaker->audio = std::move(audio);
+    task.voice = std::move(voice);
+    task.options["embedding_only"] = "true";
+    task.options["speaker_embedding_out"] = tmp_path.string();
+    (void) run_model(model, task, std::nullopt);
+
+    std::ifstream in(tmp_path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("voice embedding extraction produced no vector");
+    }
+    std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    std::error_code ec;
+    std::filesystem::remove(tmp_path, ec);
+    if (bytes.empty() || bytes.size() % sizeof(float) != 0) {
+        throw std::runtime_error("voice embedding extraction produced an invalid vector");
+    }
+    const size_t dims = bytes.size() / sizeof(float);
+    std::vector<float> values(dims);
+    std::memcpy(values.data(), bytes.data(), bytes.size());
+    std::string json = "{\"dims\":" + std::to_string(dims) + ",\"embedding\":[";
+    char buffer[32];
+    for (size_t i = 0; i < dims; ++i) {
+        std::snprintf(buffer, sizeof(buffer), "%.9g", static_cast<double>(values[i]));
+        if (i != 0) {
+            json += ',';
+        }
+        json += buffer;
+    }
+    json += "]}";
+    return json_response(std::move(json));
 }
 
 HttpResponse ServerState::handle_transcription(const HttpRequest & request) {

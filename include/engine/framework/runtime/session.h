@@ -108,6 +108,11 @@ struct WordTimestamp {
 struct VoiceReference {
     std::optional<AudioBuffer> audio = std::nullopt;
     std::optional<std::string> cached_voice_id = std::nullopt;
+    // A precomputed speaker-embedding vector used directly as the voice by
+    // families that support it, bypassing reference audio and its encoder.
+    // Clients obtain vectors from an extraction endpoint or export option and
+    // may mix them arithmetically before sending.
+    std::optional<std::vector<float>> embedding = std::nullopt;
 };
 
 struct StyleCondition {

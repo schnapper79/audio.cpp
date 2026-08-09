@@ -260,6 +260,28 @@ curl -N http://127.0.0.1:8080/v1/audio/speech \
 
 The SSE stream emits `speech.audio.delta` events with base64 PCM chunks, then `speech.audio.done`, then `data: [DONE]`. VoxCPM2 streaming requires `retry_badcase=false` because retrying a completed bad case is an offline-only behavior. Set `"stream_format": "audio"` with `"response_format": "pcm"` to receive raw PCM bytes over chunked transfer encoding instead.
 
+### `POST /v1/audio/voices/embedding`
+
+Extracts a speaker-embedding vector from reference audio, for model families that condition on one (Qwen3 CustomVoice). Accepts JSON with a server-local path or the same multipart upload shape as transcription:
+
+```bash
+curl http://127.0.0.1:8080/v1/audio/voices/embedding \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen", "voice_ref": "/path/to/voice.wav"}'
+# -> {"dims": 2048, "embedding": [ ... ]}
+
+curl http://127.0.0.1:8080/v1/audio/voices/embedding \
+  -F model=qwen -F file=@voice.wav
+```
+
+The vector is plain float data: clients may store it, and mix vectors before use — normalize each vector to unit length, average the directions by weight, renormalize, and scale to the weighted mean of the original norms (plain linear averaging shortens the vector and dulls the voice). A speech request accepts the result inline:
+
+```json
+{"model": "qwen", "input": "...", "speaker_embedding": [ ...2048 floats... ]}
+```
+
+`speaker_embedding` works per item on the batch endpoint too and combines with `instructions`.
+
 ### `POST /v1/audio/speech/batch`
 
 Runs several speech requests in one call. For model families with batched decode (Higgs Audio via `higgs_audio_tts.max_batch`, Qwen3 TTS via `qwen3_tts.max_batch`) the requests share one batched AR pass; other families run sequentially behind the same response shape.

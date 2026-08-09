@@ -533,7 +533,19 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         // request; every chunk reuses the vector instead of re-running the
         // CPU-side speaker encoder.
         std::optional<Qwen3SpeakerEmbedding> cloned_embedding;
-        if (const auto embedding_in = runtime::find_option(request.options, {"speaker_embedding_in"})) {
+        if (request.voice.has_value() && request.voice->speaker.has_value() &&
+            request.voice->speaker->embedding.has_value()) {
+            // An inline embedding vector - extracted via the embedding
+            // endpoint and possibly mixed client-side - is the voice itself.
+            const auto & values = *request.voice->speaker->embedding;
+            const int64_t hidden = assets_->config.talker.hidden_size;
+            if (static_cast<int64_t>(values.size()) != hidden) {
+                throw std::runtime_error(
+                    "speaker embedding has " + std::to_string(values.size()) +
+                    " values, expected " + std::to_string(hidden));
+            }
+            cloned_embedding = Qwen3SpeakerEmbedding{values, hidden};
+        } else if (const auto embedding_in = runtime::find_option(request.options, {"speaker_embedding_in"})) {
             // A stored or mixed embedding vector replaces the reference WAV.
             cloned_embedding = load_speaker_embedding_file(*embedding_in);
         } else {
@@ -542,6 +554,24 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
                 first_request.custom_voice->reference_audio.has_value() &&
                 speaker_encoder_ != nullptr) {
                 cloned_embedding = resolve_custom_voice_embedding(*first_request.custom_voice->reference_audio);
+            }
+        }
+        // Embedding extraction: resolve the voice, write or return it, skip
+        // generation entirely. The voices/embedding endpoint runs on this.
+        if (const auto value = runtime::find_option(request.options, {"embedding_only"})) {
+            if (runtime::parse_bool_option(*value, "embedding_only")) {
+                if (!cloned_embedding.has_value()) {
+                    throw std::runtime_error(
+                        "embedding_only requires reference audio or a speaker embedding");
+                }
+                if (const auto path = runtime::find_option(request.options, {"speaker_embedding_out"})) {
+                    write_speaker_embedding(*path, *cloned_embedding);
+                }
+                runtime::TaskResult result;
+                result.audio_output = runtime::AudioBuffer{24000, 1, {}};
+                debug::timing_log_scalar(
+                    "session.wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
+                return result;
             }
         }
         // Register priming: generate one canonical carrier take per voice,
@@ -1044,7 +1074,19 @@ std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runti
         // request; every chunk reuses the vector, and a voice the session has
         // seen before skips the speaker encoder entirely.
         std::optional<Qwen3SpeakerEmbedding> cloned_embedding;
-        if (const auto embedding_in = runtime::find_option(request.options, {"speaker_embedding_in"})) {
+        if (request.voice.has_value() && request.voice->speaker.has_value() &&
+            request.voice->speaker->embedding.has_value()) {
+            // An inline embedding vector - extracted via the embedding
+            // endpoint and possibly mixed client-side - is the voice itself.
+            const auto & values = *request.voice->speaker->embedding;
+            const int64_t hidden = assets_->config.talker.hidden_size;
+            if (static_cast<int64_t>(values.size()) != hidden) {
+                throw std::runtime_error(
+                    "speaker embedding has " + std::to_string(values.size()) +
+                    " values, expected " + std::to_string(hidden));
+            }
+            cloned_embedding = Qwen3SpeakerEmbedding{values, hidden};
+        } else if (const auto embedding_in = runtime::find_option(request.options, {"speaker_embedding_in"})) {
             // A stored or mixed embedding vector replaces the reference WAV.
             cloned_embedding = load_speaker_embedding_file(*embedding_in);
         } else {

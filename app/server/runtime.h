@@ -119,6 +119,7 @@ private:
         LoadedModel & model,
         const engine::runtime::TaskRequest & request,
         const engine::io::json::Value & body);
+    HttpResponse handle_voice_embedding(const HttpRequest & request);
     HttpResponse handle_transcription(const HttpRequest & request);
     HttpResponse handle_transcription_json(const std::string & body_text);
     HttpResponse handle_transcription_multipart(const std::string & body_text, const std::string & boundary);
