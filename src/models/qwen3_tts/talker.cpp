@@ -121,10 +121,14 @@ bool talker_prefill_equal(const Qwen3TalkerPrefill & lhs, const Qwen3TalkerPrefi
         lhs.icl_mode != rhs.icl_mode ||
         lhs.x_vector_only_mode != rhs.x_vector_only_mode ||
         lhs.reference_codes.has_value() != rhs.reference_codes.has_value() ||
+        lhs.primer_codes.has_value() != rhs.primer_codes.has_value() ||
         lhs.speaker_embedding.has_value() != rhs.speaker_embedding.has_value()) {
         return false;
     }
     if (lhs.reference_codes.has_value() && !speech_codes_equal(*lhs.reference_codes, *rhs.reference_codes)) {
+        return false;
+    }
+    if (lhs.primer_codes.has_value() && !speech_codes_equal(*lhs.primer_codes, *rhs.primer_codes)) {
         return false;
     }
     if (lhs.speaker_embedding.has_value() &&
@@ -2670,10 +2674,52 @@ public:
         double cached_step_ms = 0.0;
         CodePredictorTiming code_predictor_timing;
         CachedStepTiming cached_step_timing;
+        // Register priming: the first primer_frames of the generation are
+        // forced instead of sampled, so every chunk starts from the same
+        // acoustic state before free generation continues. Forced frames skip
+        // sampling and the code predictor entirely - their codes are given.
+        int64_t primer_frames = 0;
+        if (request.primer_codes.has_value()) {
+            const auto & primer = *request.primer_codes;
+            if (primer.code_groups != config.num_code_groups || primer.frames <= 0 ||
+                static_cast<int64_t>(primer.codes.size()) != primer.frames * primer.code_groups) {
+                throw std::runtime_error("Qwen3 talker primer codes shape mismatch");
+            }
+            if (primer.frames >= max_new_tokens) {
+                throw std::runtime_error("Qwen3 talker primer exceeds the generation budget");
+            }
+            primer_frames = primer.frames;
+        }
         for (int64_t step = 0; step < max_new_tokens; ++step) {
+            if (step < primer_frames) {
+                const auto & primer = *request.primer_codes;
+                Qwen3TalkerFrameCodes frame;
+                frame.codes.assign(
+                    primer.codes.begin() + static_cast<std::ptrdiff_t>(step * config.num_code_groups),
+                    primer.codes.begin() + static_cast<std::ptrdiff_t>((step + 1) * config.num_code_groups));
+                generated_first_codes.push_back(frame.codes.front());
+                out.generated_codes.codes.insert(
+                    out.generated_codes.codes.end(), frame.codes.begin(), frame.codes.end());
+                ++out.generated_codes.frames;
+                const auto frame_embed_start = Clock::now();
+                const auto text_hidden = step < trailing_rows
+                    ? row_at(state.trailing_text, step, config.hidden_size)
+                    : state.tts_pad;
+                const auto embed = frame_embedding(frame, text_hidden, weights_->weights(), config);
+                frame_embed_ms += engine::debug::elapsed_ms(frame_embed_start, Clock::now());
+                ensure_cached_step_capacity(prompt_steps + out.generated_codes.frames);
+                const auto step_start = Clock::now();
+                current = cached_step_graph_->run_step(embed);
+                cached_step_ms += engine::debug::elapsed_ms(step_start, Clock::now());
+                continue;
+            }
             auto logits = current.logits.values;
             const auto processor_start = Clock::now();
-            apply_main_talker_processors(logits, config, generated_first_codes, step, repetition_penalty);
+            // The EOS-forbid window counts free steps: a primed generation must
+            // not stop right after the forced carrier just because the carrier
+            // take ended with sentence-final prosody.
+            apply_main_talker_processors(
+                logits, config, generated_first_codes, step - primer_frames, repetition_penalty);
             const int32_t first_code = options.do_sample
                 ? sample_index(
                     logits,

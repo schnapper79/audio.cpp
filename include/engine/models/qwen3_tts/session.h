@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace engine::models::qwen3_tts {
@@ -106,6 +107,13 @@ private:
     // embedding-only row. Requires the package to ship the speech-tokenizer
     // encoder and the request to carry voice_ref + reference_text.
     bool custom_voice_icl_ = false;
+    // Experimental register priming: every chunk's generation is forced to
+    // start with a canonical carrier take (its codes are fed instead of
+    // sampled, its audio trimmed off), so chunks share one acoustic starting
+    // state without touching the instruct-capable CustomVoice prompt.
+    bool register_primer_ = false;
+    std::string primer_text_ = "Alright,";
+    std::unordered_map<std::string, Qwen3SpeechCodes> primer_cache_;
     Qwen3TTSPerfMode perf_mode_ = Qwen3TTSPerfMode::Standard;
     Qwen3TextTokenizer text_tokenizer_;
     Qwen3Talker talker_;

@@ -30,6 +30,12 @@ struct Qwen3TalkerPrefill {
     std::string language = "Auto";
     bool icl_mode = false;
     bool x_vector_only_mode = false;
+    // Register priming: these frames are force-fed as the start of the
+    // generation instead of being sampled, so every chunk begins in the same
+    // acoustic state (register, energy) before free generation continues. The
+    // corresponding carrier text must be part of input_ids; the caller trims
+    // the primed frames from the decoded audio.
+    std::optional<Qwen3SpeechCodes> primer_codes = std::nullopt;
 };
 
 struct Qwen3TalkerCodes {

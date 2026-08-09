@@ -131,6 +131,20 @@ bool custom_voice_icl_from_options(const runtime::SessionOptions & options) {
     return false;
 }
 
+bool register_primer_from_options(const runtime::SessionOptions & options) {
+    if (const auto value = runtime::find_option(options.options, {"qwen3_tts.register_primer"})) {
+        return runtime::parse_bool_option(*value, "qwen3_tts.register_primer");
+    }
+    return false;
+}
+
+std::string primer_text_from_options(const runtime::SessionOptions & options) {
+    // The comma matters: a sentence-final carrier ("Alright.") invites the
+    // model to emit EOS right after the forced frames; continuing prosody
+    // keeps the generation going into the chunk text.
+    return runtime::find_option(options.options, {"qwen3_tts.primer_text"}).value_or("Alright,");
+}
+
 bool mem_saver_from_options(const runtime::SessionOptions & options) {
     if (const auto value = runtime::find_option(options.options, {"qwen3_tts.mem_saver", "mem_saver"})) {
         return runtime::parse_bool_option(*value, "qwen3_tts.mem_saver");
@@ -262,6 +276,8 @@ Qwen3TTSSession::Qwen3TTSSession(
       assets_(require_assets(std::move(assets))),
       mem_saver_(mem_saver_from_options(options)),
       custom_voice_icl_(custom_voice_icl_from_options(options)),
+      register_primer_(register_primer_from_options(options)),
+      primer_text_(primer_text_from_options(options)),
       perf_mode_(perf_mode_from_options(options)),
       text_tokenizer_(assets_),
       talker_(assets_->config.talker),
@@ -328,6 +344,8 @@ Qwen3TTSSession::Qwen3TTSSession(
             key != "qwen3_tts.voice_prompt_cache_slots" &&
             key != "qwen3_tts.speaker_embedding_cache_slots" &&
             key != "qwen3_tts.custom_voice_icl" &&
+            key != "qwen3_tts.register_primer" &&
+            key != "qwen3_tts.primer_text" &&
             key != "qwen3_tts.perf_mode" &&
             key != "qwen3_tts.mem_saver") {
             throw std::runtime_error("unknown Qwen3 TTS session option: " + key);
@@ -523,12 +541,70 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
                 cloned_embedding = resolve_custom_voice_embedding(*first_request.custom_voice->reference_audio);
             }
         }
+        // Register priming: generate one canonical carrier take per voice,
+        // instruct, and language, then force every chunk to start with it.
+        const Qwen3SpeechCodes * primer = nullptr;
+        if (register_primer_) {
+            const Qwen3TTSRequest first_request = make_request(chunk_requests.front());
+            std::string primer_key = primer_text_ + '\x1f' + first_request.language + '\x1f';
+            if (first_request.custom_voice.has_value()) {
+                primer_key += first_request.custom_voice->speaker + '\x1f' +
+                    first_request.custom_voice->instruct + '\x1f';
+            }
+            if (cloned_embedding.has_value()) {
+                uint64_t hash = 1469598103934665603ull;
+                hash = fnv1a_mix(
+                    hash,
+                    cloned_embedding->values.data(),
+                    cloned_embedding->values.size() * sizeof(float));
+                primer_key += std::to_string(hash);
+            }
+            auto cached = primer_cache_.find(primer_key);
+            if (cached == primer_cache_.end()) {
+                const auto carrier_start = Clock::now();
+                Qwen3TTSRequest carrier_request = first_request;
+                carrier_request.text = primer_text_;
+                // A fixed seed makes the carrier take canonical: every session
+                // regenerates the same acoustic starting state for this voice.
+                carrier_request.generation.seed = 424242;
+                carrier_request.generation.max_new_tokens =
+                    std::min<int64_t>(carrier_request.generation.max_new_tokens, 256);
+                auto carrier_prefill = prompt_builder.build_prefill(
+                    carrier_request,
+                    cloned_embedding.has_value() ? &*cloned_embedding : nullptr);
+                auto carrier_codes = talker_step_->generate(
+                    carrier_prefill,
+                    carrier_request.generation,
+                    carrier_request.generation.repetition_penalty);
+                debug::timing_log_scalar(
+                    "qwen3_tts.primer.carrier_ms",
+                    engine::debug::elapsed_ms(carrier_start, Clock::now()));
+                if (carrier_codes.generated_codes.frames >= 3) {
+                    cached = primer_cache_.emplace(primer_key, std::move(carrier_codes.generated_codes)).first;
+                } else {
+                    std::fprintf(
+                        stderr,
+                        "[qwen3_tts] register primer disabled: carrier take produced %lld frames\n",
+                        static_cast<long long>(carrier_codes.generated_codes.frames));
+                }
+            }
+            if (cached != primer_cache_.end()) {
+                primer = &cached->second;
+                debug::trace_log_scalar("qwen3_tts.primer.frames", primer->frames);
+            }
+        }
         for (const auto & chunk_request : chunk_requests) {
-            const Qwen3TTSRequest qwen_request = make_request(chunk_request);
+            Qwen3TTSRequest qwen_request = make_request(chunk_request);
+            if (primer != nullptr) {
+                qwen_request.text = primer_text_ + " " + qwen_request.text;
+            }
             const auto prefill_start = Clock::now();
-            const auto prefill = prompt_builder.build_prefill(
+            auto prefill = prompt_builder.build_prefill(
                 qwen_request,
                 cloned_embedding.has_value() ? &*cloned_embedding : nullptr);
+            if (primer != nullptr) {
+                prefill.primer_codes = *primer;
+            }
             prefill_ms += engine::debug::elapsed_ms(prefill_start, Clock::now());
             // Sprecher-Embedding auf Wunsch herausschreiben - dasselbe Ventil
             // wie im Base-Klonpfad, damit ein CustomVoice-Setup ohne geladenes
@@ -549,9 +625,32 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
                 qwen_request.generation.repetition_penalty);
             talker_ms += engine::debug::elapsed_ms(talker_start, Clock::now());
             const auto decoder_start = Clock::now();
-            runtime::append_audio_buffer(
-                merged_audio,
-                speech_decoder_->decode(codes.generated_codes));
+            if (primer != nullptr && codes.generated_codes.frames > primer->frames) {
+                // The forced carrier frames are decoded for acoustic context
+                // and trimmed off, exactly like an ICL reference.
+                const int64_t groups = codes.generated_codes.code_groups;
+                Qwen3SpeechCodes primer_part;
+                primer_part.code_groups = groups;
+                primer_part.frames = primer->frames;
+                primer_part.codes.assign(
+                    codes.generated_codes.codes.begin(),
+                    codes.generated_codes.codes.begin() +
+                        static_cast<std::ptrdiff_t>(primer->frames * groups));
+                Qwen3SpeechCodes rest;
+                rest.code_groups = groups;
+                rest.frames = codes.generated_codes.frames - primer->frames;
+                rest.codes.assign(
+                    codes.generated_codes.codes.begin() +
+                        static_cast<std::ptrdiff_t>(primer->frames * groups),
+                    codes.generated_codes.codes.end());
+                runtime::append_audio_buffer(
+                    merged_audio,
+                    speech_decoder_->decode_and_trim_reference(primer_part, rest));
+            } else {
+                runtime::append_audio_buffer(
+                    merged_audio,
+                    speech_decoder_->decode(codes.generated_codes));
+            }
             decoder_ms += engine::debug::elapsed_ms(decoder_start, Clock::now());
         }
         release_talker_cached_step_graph();
