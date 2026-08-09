@@ -334,19 +334,79 @@ std::vector<HiggsGenerationResult> HiggsGenerator::generate_batch(
 
     const auto prefill_start = Clock::now();
     std::vector<int64_t> visible_start(static_cast<size_t>(slots), 0);
-    std::vector<HiggsARDecodeOutput> prefill_logits(static_cast<size_t>(slots));
     for (int64_t slot = 0; slot < slots; ++slot) {
-        const auto & plan = plans[static_cast<size_t>(slot)];
-        visible_start[static_cast<size_t>(slot)] = prompt_capacity - plan.prompt_steps;
-        HiggsARBatchPrefillGraph prefill(
-            ar_,
-            *cache,
-            slot,
-            plan.prompt_steps,
-            visible_start[static_cast<size_t>(slot)],
-            ar_decode_graph_arena_bytes_);
-        prefill_logits[static_cast<size_t>(slot)] = prefill.run(plan.prepared.ar_input);
+        visible_start[static_cast<size_t>(slot)] =
+            prompt_capacity - plans[static_cast<size_t>(slot)].prompt_steps;
     }
+    // Slots whose prompts share the same reference prefix - same voice, same
+    // reference transcript - prefill the reference once. The first slot of a
+    // run computes the full prompt; every other slot receives the prefix rows
+    // by device-side broadcast (K re-rotated to its own offset) and only
+    // prefills its text suffix. For short lines against a long reference the
+    // prefix is ~90% of the prompt, so this removes most of the prefill work
+    // that voice grouping used to duplicate per slot.
+    const auto same_prefix = [&](const SlotPlan & a, const SlotPlan & b) {
+        const int64_t prefix = a.prepared.prefix_steps;
+        return prefix > 0 && b.prepared.prefix_steps == prefix &&
+            std::equal(
+                a.prepared.ar_input.text_tokens.begin(),
+                a.prepared.ar_input.text_tokens.begin() + prefix,
+                b.prepared.ar_input.text_tokens.begin()) &&
+            std::equal(
+                a.prepared.ar_input.fused_code_ids.begin(),
+                a.prepared.ar_input.fused_code_ids.begin() + prefix * codebooks,
+                b.prepared.ar_input.fused_code_ids.begin());
+    };
+    std::vector<HiggsARDecodeOutput> prefill_logits(static_cast<size_t>(slots));
+    int64_t shared_prefix_slots = 0;
+    for (int64_t run_start = 0; run_start < slots;) {
+        int64_t run_end = run_start + 1;
+        while (run_end < slots &&
+               same_prefix(plans[static_cast<size_t>(run_start)], plans[static_cast<size_t>(run_end)])) {
+            ++run_end;
+        }
+        {
+            const auto index = static_cast<size_t>(run_start);
+            HiggsARBatchPrefillGraph prefill(
+                ar_,
+                *cache,
+                run_start,
+                plans[index].prompt_steps,
+                visible_start[index],
+                ar_decode_graph_arena_bytes_);
+            prefill_logits[index] = prefill.run(plans[index].prepared.ar_input);
+        }
+        if (run_end - run_start > 1) {
+            const int64_t prefix_steps = plans[static_cast<size_t>(run_start)].prepared.prefix_steps;
+            std::vector<std::pair<int64_t, int64_t>> targets;
+            targets.reserve(static_cast<size_t>(run_end - run_start - 1));
+            for (int64_t slot = run_start + 1; slot < run_end; ++slot) {
+                targets.emplace_back(slot, visible_start[static_cast<size_t>(slot)]);
+            }
+            broadcast_higgs_batch_prefix(
+                ar_,
+                *cache,
+                run_start,
+                visible_start[static_cast<size_t>(run_start)],
+                prefix_steps,
+                targets);
+            for (int64_t slot = run_start + 1; slot < run_end; ++slot) {
+                const auto index = static_cast<size_t>(slot);
+                HiggsARBatchPrefillGraph prefill(
+                    ar_,
+                    *cache,
+                    slot,
+                    plans[index].prompt_steps,
+                    visible_start[index],
+                    ar_decode_graph_arena_bytes_,
+                    prefix_steps);
+                prefill_logits[index] = prefill.run(plans[index].prepared.ar_input);
+                ++shared_prefix_slots;
+            }
+        }
+        run_start = run_end;
+    }
+    engine::debug::trace_log_scalar("higgs_audio_tts.batch.shared_prefix_slots", shared_prefix_slots);
     engine::debug::timing_log_scalar(
         "higgs_audio_tts.batch.prefill_ms", engine::debug::elapsed_ms(prefill_start, Clock::now()));
 
@@ -669,9 +729,17 @@ HiggsGenerationResult HiggsGenerator::generate(const HiggsGenerationRequest & re
     engine::debug::trace_log_scalar("higgs_audio_tts.generator.reference_prefix_steps", prepared.prefix_steps);
     const int64_t max_cache_steps = prompt_steps + request.options.max_tokens;
     const int64_t initial_cache_steps = bucketed_initial_cache_steps(prompt_steps, request.options.max_tokens);
+    // A cache that grew during the previous chunk is larger than this chunk's
+    // bucket. Keeping it costs decode throughput -- flash attention reads the
+    // whole allocated window every step -- so it is kept only when it buys
+    // something: a reusable reference prefix, which saves re-prefilling the
+    // reference codes. Without that, the exact bucket is rebuilt as before.
+    const bool prefix_reusable =
+        reference_cache_hit && reference_kv_ready_ &&
+        ar_kv_cache_ != nullptr && ar_kv_cache_->valid_steps() >= prepared.prefix_steps;
     const bool cache_rebuild =
         ar_kv_cache_ == nullptr || !ar_kv_cache_->can_run(*ar_, initial_cache_steps) ||
-        ar_kv_cache_->cache_steps() != initial_cache_steps;
+        (ar_kv_cache_->cache_steps() != initial_cache_steps && !prefix_reusable);
     if (cache_rebuild) {
         decode_graph_.reset();
         ar_kv_cache_ = std::make_unique<HiggsARKVCache>(ar_, initial_cache_steps);

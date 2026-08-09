@@ -8,6 +8,7 @@
 #include "engine/framework/modules/lookup_modules.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/framework/modules/optimizations/fast_projection_modules.h"
+#include "engine/framework/modules/positional_modules.h"
 #include "engine/framework/modules/primitive_modules.h"
 #include "engine/framework/modules/structural_modules.h"
 
@@ -779,6 +780,97 @@ void copy_higgs_batch_kv_cache(
     }
 }
 
+void broadcast_higgs_batch_prefix(
+    const std::shared_ptr<HiggsARRuntime> & runtime,
+    HiggsARBatchKVCache & cache,
+    int64_t src_slot,
+    int64_t src_offset,
+    int64_t prefix_steps,
+    const std::vector<std::pair<int64_t, int64_t>> & targets) {
+    if (runtime == nullptr) {
+        throw std::runtime_error("Higgs TTS AR prefix broadcast requires runtime");
+    }
+    if (prefix_steps <= 0 || targets.empty()) {
+        throw std::runtime_error("Higgs TTS AR prefix broadcast requires prefix steps and targets");
+    }
+    const auto & config = runtime->assets().config;
+    const size_t layer_count = runtime->weights().decoder.layers.size();
+    const modules::RoPEModule rope({config.text.head_dim, GGML_ROPE_TYPE_NEOX, config.text.rope_theta});
+    // One graph per target, so the transient device memory for the re-rotated
+    // K rows stays bounded by a single target's prefix instead of scaling with
+    // the whole batch.
+    for (const auto & [dst_slot, dst_offset] : targets) {
+        const int64_t delta = dst_offset - src_offset;
+        const size_t node_budget = layer_count * 8 + 64;
+        ggml_init_params params{
+            ggml_tensor_overhead() * (node_budget + 8) + ggml_graph_overhead_custom(node_budget, false),
+            nullptr,
+            true};
+        std::unique_ptr<ggml_context, GgmlContextDeleter> ctx(ggml_init(params));
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to initialize Higgs TTS AR prefix broadcast context");
+        }
+        core::ModuleBuildContext build_ctx{
+            ctx.get(), "higgs_audio_tts.ar.batch_prefix_broadcast", runtime->backend_type()};
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), node_budget, false);
+        ggml_tensor * delta_positions = nullptr;
+        core::TensorValue delta_value;
+        if (delta != 0) {
+            delta_positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, prefix_steps);
+            delta_value = core::wrap_tensor(
+                delta_positions, core::TensorShape::from_dims({prefix_steps}), GGML_TYPE_I32);
+        }
+        for (size_t layer = 0; layer < layer_count; ++layer) {
+            auto key_src = higgs_batch_cache_view(
+                build_ctx, cache.key_tensor(layer), src_slot, src_offset, prefix_steps,
+                config.text.num_key_value_heads, config.text.head_dim);
+            auto key_dst = higgs_batch_cache_view(
+                build_ctx, cache.key_tensor(layer), dst_slot, dst_offset, prefix_steps,
+                config.text.num_key_value_heads, config.text.head_dim);
+            if (delta != 0) {
+                // Same trick as llama.cpp's context shift: RoPE at position
+                // `delta` composes with the rotation already stored in K, so
+                // the copied keys match their new cache rows' positions.
+                auto rotated = rope.build(build_ctx, key_src, delta_value);
+                ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), rotated.tensor, key_dst.tensor));
+            } else {
+                ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), key_src.tensor, key_dst.tensor));
+            }
+            auto value_src = higgs_batch_cache_view(
+                build_ctx, cache.value_tensor(layer), src_slot, src_offset, prefix_steps,
+                config.text.num_key_value_heads, config.text.head_dim);
+            auto value_dst = higgs_batch_cache_view(
+                build_ctx, cache.value_tensor(layer), dst_slot, dst_offset, prefix_steps,
+                config.text.num_key_value_heads, config.text.head_dim);
+            ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), value_src.tensor, value_dst.tensor));
+        }
+        ggml_backend_buffer_t buffer = nullptr;
+        if (delta != 0) {
+            // With delta 0 every tensor in the context is a view of the live
+            // cache; ggml then has nothing to allocate and returns null, which
+            // must not be read as failure (copy_higgs_batch_kv_cache skips the
+            // allocator entirely for the same reason).
+            buffer = ggml_backend_alloc_ctx_tensors(ctx.get(), runtime->backend());
+            if (buffer == nullptr) {
+                throw std::runtime_error("failed to allocate Higgs TTS AR prefix broadcast graph");
+            }
+            const int32_t delta_i32 = static_cast<int32_t>(delta);
+            std::vector<int32_t> values(static_cast<size_t>(prefix_steps), delta_i32);
+            ggml_backend_tensor_set(delta_positions, values.data(), 0, values.size() * sizeof(int32_t));
+        }
+        core::set_backend_threads(runtime->backend(), runtime->threads());
+        const ggml_status status = engine::core::compute_backend_graph(runtime->backend(), graph);
+        engine::core::release_backend_graph_resources(runtime->backend(), graph);
+        const bool success = status == GGML_STATUS_SUCCESS;
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+        if (!success) {
+            throw std::runtime_error("Higgs TTS AR prefix broadcast failed");
+        }
+    }
+}
+
 struct HiggsARBatchPrefillGraph::Impl {
     Impl(
         std::shared_ptr<HiggsARRuntime> input_runtime,
@@ -786,16 +878,22 @@ struct HiggsARBatchPrefillGraph::Impl {
         int64_t input_slot,
         int64_t input_prompt_steps,
         int64_t input_cache_offset,
-        size_t graph_arena_bytes)
+        size_t graph_arena_bytes,
+        int64_t input_start_step)
         : runtime(std::move(input_runtime)),
           cache(&input_cache),
           slot(input_slot),
-          prompt_steps(input_prompt_steps) {
+          prompt_steps(input_prompt_steps),
+          start_step(input_start_step),
+          run_steps(input_prompt_steps - input_start_step) {
         if (runtime == nullptr) {
             throw std::runtime_error("Higgs TTS AR batch prefill graph requires runtime");
         }
         if (prompt_steps <= 0) {
             throw std::runtime_error("Higgs TTS AR batch prefill graph requires a positive prompt");
+        }
+        if (start_step < 0 || start_step >= prompt_steps) {
+            throw std::runtime_error("Higgs TTS AR batch prefill start step is outside the prompt");
         }
         if (input_cache_offset < 0 || input_cache_offset + prompt_steps > cache->cache_steps()) {
             throw std::runtime_error("Higgs TTS AR batch prefill does not fit the cache");
@@ -810,11 +908,11 @@ struct HiggsARBatchPrefillGraph::Impl {
         core::ModuleBuildContext build_ctx{
             ctx.get(), "higgs_audio_tts.ar.batch_prefill", runtime->backend_type()};
 
-        text_tokens = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, prompt_steps);
+        text_tokens = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, run_steps);
         fused_code_ids =
-            ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, config.audio.num_codebooks, prompt_steps);
-        text_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, prompt_steps, 1);
-        code_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, prompt_steps, 1);
+            ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, config.audio.num_codebooks, run_steps);
+        text_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, run_steps, 1);
+        code_gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, run_steps, 1);
         auto x = build_higgs_prefill_input_embedding(
             build_ctx,
             tensor_weights,
@@ -823,48 +921,72 @@ struct HiggsARBatchPrefillGraph::Impl {
             fused_code_ids,
             text_gate,
             code_gate,
-            prompt_steps);
-        positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, prompt_steps);
+            run_steps);
+        positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, run_steps);
         auto positions_value =
-            core::wrap_tensor(positions, core::TensorShape::from_dims({prompt_steps}), GGML_TYPE_I32);
+            core::wrap_tensor(positions, core::TensorShape::from_dims({run_steps}), GGML_TYPE_I32);
         attention_mask =
-            ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, prompt_steps, prompt_steps, 1, 1);
+            ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, prompt_steps, run_steps, 1, 1);
         auto attention_mask_value = core::wrap_tensor(
             attention_mask,
-            core::TensorShape::from_dims({1, 1, prompt_steps, prompt_steps}),
+            core::TensorShape::from_dims({1, 1, run_steps, prompt_steps}),
             GGML_TYPE_F16);
 
         graph = ggml_new_graph_custom(ctx.get(), 262144, false);
         const HiggsQwenDecoderComponent decoder(config.text, tensor_weights.packed_qkv);
         for (size_t layer_index = 0; layer_index < tensor_weights.decoder.layers.size(); ++layer_index) {
+            // A suffix prefill attends over the prefix rows already sitting in
+            // this slot's cache (put there by broadcast_higgs_batch_prefix).
+            std::optional<core::TensorValue> prefix_key;
+            std::optional<core::TensorValue> prefix_value;
+            if (start_step > 0) {
+                prefix_key = higgs_batch_cache_view(
+                    build_ctx,
+                    cache->key_tensor(layer_index),
+                    slot,
+                    input_cache_offset,
+                    start_step,
+                    config.text.num_key_value_heads,
+                    config.text.head_dim);
+                prefix_value = higgs_batch_cache_view(
+                    build_ctx,
+                    cache->value_tensor(layer_index),
+                    slot,
+                    input_cache_offset,
+                    start_step,
+                    config.text.num_key_value_heads,
+                    config.text.head_dim);
+            }
             auto out = decoder.build_prefill_layer(
                 build_ctx,
                 x,
                 positions_value,
                 tensor_weights.decoder.layers[layer_index],
-                attention_mask_value);
+                attention_mask_value,
+                prefix_key,
+                prefix_value);
             x = out.output;
             auto key_dest = higgs_batch_cache_view(
                 build_ctx,
                 cache->key_tensor(layer_index),
                 slot,
-                input_cache_offset,
-                prompt_steps,
+                input_cache_offset + start_step,
+                run_steps,
                 config.text.num_key_value_heads,
                 config.text.head_dim);
             auto value_dest = higgs_batch_cache_view(
                 build_ctx,
                 cache->value_tensor(layer_index),
                 slot,
-                input_cache_offset,
-                prompt_steps,
+                input_cache_offset + start_step,
+                run_steps,
                 config.text.num_key_value_heads,
                 config.text.head_dim);
             ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), out.key.tensor, key_dest.tensor));
             ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), out.value.tensor, value_dest.tensor));
         }
 
-        x = modules::SliceModule({1, prompt_steps - 1, 1}).build(build_ctx, x);
+        x = modules::SliceModule({1, run_steps - 1, 1}).build(build_ctx, x);
         x = modules::RMSNormModule({config.text.hidden_size, config.text.rms_norm_eps, true, false})
                 .build(build_ctx, x, {tensor_weights.norm, std::nullopt});
         auto logits = build_modality_logits(build_ctx, x, tensor_weights, config);
@@ -879,8 +1001,10 @@ struct HiggsARBatchPrefillGraph::Impl {
         // Positions are shifted by the left padding so that every slot's first
         // generated token lands on the same position, which is what lets one
         // shared position vector drive the batched decode graph.
-        positions_values = modules::qwen_position_ids(prompt_steps, input_cache_offset);
-        attention_mask_values = modules::qwen_causal_prefill_mask_values(1, prompt_steps);
+        positions_values = modules::qwen_position_ids(run_steps, input_cache_offset + start_step);
+        attention_mask_values = start_step > 0
+            ? modules::qwen_causal_suffix_mask_values(1, run_steps, start_step)
+            : modules::qwen_causal_prefill_mask_values(1, prompt_steps);
     }
 
     ~Impl() {
@@ -899,12 +1023,28 @@ struct HiggsARBatchPrefillGraph::Impl {
             static_cast<int64_t>(input.code_gate.size()) != prompt_steps) {
             throw std::runtime_error("Higgs TTS AR batch prefill input shape mismatch");
         }
+        // The caller passes the full prompt; a suffix graph consumes only the
+        // rows from start_step on.
         ggml_backend_tensor_set(
-            text_tokens, input.text_tokens.data(), 0, input.text_tokens.size() * sizeof(int32_t));
+            text_tokens,
+            input.text_tokens.data() + start_step,
+            0,
+            static_cast<size_t>(run_steps) * sizeof(int32_t));
         ggml_backend_tensor_set(
-            fused_code_ids, input.fused_code_ids.data(), 0, input.fused_code_ids.size() * sizeof(int32_t));
-        ggml_backend_tensor_set(text_gate, input.text_gate.data(), 0, input.text_gate.size() * sizeof(float));
-        ggml_backend_tensor_set(code_gate, input.code_gate.data(), 0, input.code_gate.size() * sizeof(float));
+            fused_code_ids,
+            input.fused_code_ids.data() + start_step * config.audio.num_codebooks,
+            0,
+            static_cast<size_t>(run_steps * config.audio.num_codebooks) * sizeof(int32_t));
+        ggml_backend_tensor_set(
+            text_gate,
+            input.text_gate.data() + start_step,
+            0,
+            static_cast<size_t>(run_steps) * sizeof(float));
+        ggml_backend_tensor_set(
+            code_gate,
+            input.code_gate.data() + start_step,
+            0,
+            static_cast<size_t>(run_steps) * sizeof(float));
         ggml_backend_tensor_set(
             positions, positions_values.data(), 0, positions_values.size() * sizeof(int32_t));
         ggml_backend_tensor_set(
@@ -930,6 +1070,8 @@ struct HiggsARBatchPrefillGraph::Impl {
     HiggsARBatchKVCache * cache = nullptr;
     int64_t slot = 0;
     int64_t prompt_steps = 0;
+    int64_t start_step = 0;
+    int64_t run_steps = 0;
     std::unique_ptr<ggml_context, GgmlContextDeleter> ctx;
     ggml_tensor * text_tokens = nullptr;
     ggml_tensor * fused_code_ids = nullptr;
@@ -950,9 +1092,10 @@ HiggsARBatchPrefillGraph::HiggsARBatchPrefillGraph(
     int64_t slot,
     int64_t prompt_steps,
     int64_t cache_offset,
-    size_t graph_arena_bytes)
+    size_t graph_arena_bytes,
+    int64_t start_step)
     : impl_(std::make_unique<Impl>(
-          std::move(runtime), cache, slot, prompt_steps, cache_offset, graph_arena_bytes)) {}
+          std::move(runtime), cache, slot, prompt_steps, cache_offset, graph_arena_bytes, start_step)) {}
 
 HiggsARBatchPrefillGraph::~HiggsARBatchPrefillGraph() = default;
 

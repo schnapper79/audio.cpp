@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace engine::core {
@@ -171,7 +172,10 @@ void copy_higgs_batch_kv_cache(
 
 // Prefills one slot of a batched cache. Each slot is prefilled on its own
 // because prompt lengths differ; only the decode loop runs batched, which is
-// where the time goes.
+// where the time goes. With `start_step > 0` only the suffix
+// [start_step, prompt_steps) is computed; the rows before it must already sit
+// in the cache at [cache_offset, cache_offset + start_step) - typically put
+// there by broadcast_higgs_batch_prefix - and serve as attention prefix.
 class HiggsARBatchPrefillGraph {
 public:
     HiggsARBatchPrefillGraph(
@@ -180,7 +184,8 @@ public:
         int64_t slot,
         int64_t prompt_steps,
         int64_t cache_offset,
-        size_t graph_arena_bytes);
+        size_t graph_arena_bytes,
+        int64_t start_step = 0);
     ~HiggsARBatchPrefillGraph();
 
     HiggsARBatchPrefillGraph(const HiggsARBatchPrefillGraph &) = delete;
@@ -192,6 +197,21 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// Copies the cached prefill rows [src_offset, src_offset + prefix_steps) of
+// slot `src_slot` into every (slot, offset) target on the device. K rows are
+// re-rotated by each target's offset difference (the llama.cpp context-shift
+// trick: applying RoPE at position delta composes with the stored rotation),
+// so the copied keys stay consistent with row index == RoPE position. V rows
+// copy verbatim. Lets a batch whose slots share one reference voice prefill
+// the reference once instead of once per slot.
+void broadcast_higgs_batch_prefix(
+    const std::shared_ptr<HiggsARRuntime> & runtime,
+    HiggsARBatchKVCache & cache,
+    int64_t src_slot,
+    int64_t src_offset,
+    int64_t prefix_steps,
+    const std::vector<std::pair<int64_t, int64_t>> & targets);
 
 class HiggsARBatchDecodeGraph {
 public:
