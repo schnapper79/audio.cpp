@@ -35,10 +35,14 @@ Qwen3TalkerPrefill Qwen3TTSCustomVoicePromptBuilder::build_prefill(
     if (!request.custom_voice.has_value()) {
         throw std::runtime_error("Qwen3 custom voice prefill requires custom voice input");
     }
-    const bool cloned = request.custom_voice->reference_audio.has_value();
+    // A voice comes from reference audio (encoded here), or directly as a
+    // precomputed embedding vector - the latter needs neither audio nor the
+    // speaker encoder and is what embedding import/mixing feeds in.
+    const bool cloned =
+        request.custom_voice->reference_audio.has_value() || precomputed_speaker_embedding != nullptr;
     if (request.custom_voice->speaker.empty() && !cloned) {
         throw std::runtime_error(
-            "Qwen3 custom voice prefill requires speaker or reference audio");
+            "Qwen3 custom voice prefill requires speaker, reference audio, or speaker embedding");
     }
     if (cloned && precomputed_speaker_embedding == nullptr && speaker_encoder_ == nullptr) {
         throw std::runtime_error(

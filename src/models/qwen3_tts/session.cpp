@@ -533,7 +533,10 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         // request; every chunk reuses the vector instead of re-running the
         // CPU-side speaker encoder.
         std::optional<Qwen3SpeakerEmbedding> cloned_embedding;
-        {
+        if (const auto embedding_in = runtime::find_option(request.options, {"speaker_embedding_in"})) {
+            // A stored or mixed embedding vector replaces the reference WAV.
+            cloned_embedding = load_speaker_embedding_file(*embedding_in);
+        } else {
             const Qwen3TTSRequest first_request = make_request(chunk_requests.front());
             if (first_request.custom_voice.has_value() &&
                 first_request.custom_voice->reference_audio.has_value() &&
@@ -892,6 +895,37 @@ std::vector<runtime::BatchedTaskResult> Qwen3TTSSession::run_batch(
     return out;
 }
 
+// Reads a raw little-endian float32 vector - the exact format
+// speaker_embedding_out writes - and validates it against the talker width.
+// Feeding a stored or arithmetically mixed vector this way replaces the
+// reference-WAV + encoder path entirely.
+Qwen3SpeakerEmbedding Qwen3TTSSession::load_speaker_embedding_file(const std::string & path) const {
+    std::FILE * in = std::fopen(path.c_str(), "rb");
+    if (in == nullptr) {
+        throw std::runtime_error("cannot read speaker_embedding_in: " + path);
+    }
+    std::fseek(in, 0, SEEK_END);
+    const long size = std::ftell(in);
+    std::fseek(in, 0, SEEK_SET);
+    const int64_t hidden = assets_->config.talker.hidden_size;
+    if (size != static_cast<long>(hidden * static_cast<int64_t>(sizeof(float)))) {
+        std::fclose(in);
+        throw std::runtime_error(
+            "speaker_embedding_in has " + std::to_string(size) + " bytes, expected " +
+            std::to_string(hidden * static_cast<int64_t>(sizeof(float))) + " (" +
+            std::to_string(hidden) + " float32 values): " + path);
+    }
+    Qwen3SpeakerEmbedding embedding;
+    embedding.dims = hidden;
+    embedding.values.resize(static_cast<size_t>(hidden));
+    const size_t read = std::fread(embedding.values.data(), sizeof(float), embedding.values.size(), in);
+    std::fclose(in);
+    if (read != embedding.values.size()) {
+        throw std::runtime_error("failed to read speaker_embedding_in: " + path);
+    }
+    return embedding;
+}
+
 void Qwen3TTSSession::write_speaker_embedding(
     const std::string & path,
     const Qwen3SpeakerEmbedding & embedding) const {
@@ -1010,7 +1044,10 @@ std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runti
         // request; every chunk reuses the vector, and a voice the session has
         // seen before skips the speaker encoder entirely.
         std::optional<Qwen3SpeakerEmbedding> cloned_embedding;
-        {
+        if (const auto embedding_in = runtime::find_option(request.options, {"speaker_embedding_in"})) {
+            // A stored or mixed embedding vector replaces the reference WAV.
+            cloned_embedding = load_speaker_embedding_file(*embedding_in);
+        } else {
             const Qwen3TTSRequest first_request = make_request(chunk_requests.front());
             if (first_request.custom_voice.has_value() &&
                 first_request.custom_voice->reference_audio.has_value() &&

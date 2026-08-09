@@ -154,6 +154,12 @@
         "required": false
       },
       {
+        "name": "speaker_embedding_in",
+        "type": "string",
+        "description": "CustomVoice: path to a raw float32 speaker embedding (the format speaker_embedding_out writes) used as the voice instead of reference audio. Enables stored-voice reuse and embedding mixing/morphing.",
+        "required": false
+      },
+      {
         "name": "text_chunk_size",
         "type": "int",
         "description": "Maximum UTF-8 codepoints per long-form text chunk; default 8192.",
