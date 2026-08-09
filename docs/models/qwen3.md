@@ -117,6 +117,7 @@ audiocpp_cli --task tts --family qwen3_tts --model models/Qwen3-TTS-12Hz-1.7B-Cu
 |---|---|---:|---|
 | `qwen3_tts.max_batch` | 1 to 8 | `1` | Requests decoded together. `1` keeps the single-sequence path. Values above 8 are clamped on CUDA with a logged warning: ggml's vector-matmul kernels cover a batch of at most 8, past that the fallback path is far slower than not batching. |
 | `qwen3_tts.speaker_embedding_cache_slots` | integer | `1024` | Cloned-voice embeddings cached by reference-audio hash (~8 KB each). A previously seen clip skips the CPU-side speaker encoder entirely, in single and batched runs alike. `0` disables caching. |
+| `qwen3_tts.custom_voice_icl` | bool | `false` | Experimental: clone CustomVoice speakers through the Base ICL prompt — reference audio codes plus transcript in context instead of the embedding row alone. Needs `--voice-ref` **and** `--reference-text`, speech-tokenizer encoder weights in the package, and a reference in the target language (a cross-language reference wrecks pronunciation). Fixes the per-chunk pitch sink of embedding-only cloning (measured: within-sentence drift −4.0 → +0.6 semitones, register centered on the reference); `--instruct` is prepended to the ICL prompt and stays intelligible. |
 
 Notes:
 

@@ -124,6 +124,13 @@ core::BackendConfig voice_prompt_backend_config(const runtime::SessionOptions & 
     return config;
 }
 
+bool custom_voice_icl_from_options(const runtime::SessionOptions & options) {
+    if (const auto value = runtime::find_option(options.options, {"qwen3_tts.custom_voice_icl"})) {
+        return runtime::parse_bool_option(*value, "qwen3_tts.custom_voice_icl");
+    }
+    return false;
+}
+
 bool mem_saver_from_options(const runtime::SessionOptions & options) {
     if (const auto value = runtime::find_option(options.options, {"qwen3_tts.mem_saver", "mem_saver"})) {
         return runtime::parse_bool_option(*value, "qwen3_tts.mem_saver");
@@ -254,6 +261,7 @@ Qwen3TTSSession::Qwen3TTSSession(
       task_(task),
       assets_(require_assets(std::move(assets))),
       mem_saver_(mem_saver_from_options(options)),
+      custom_voice_icl_(custom_voice_icl_from_options(options)),
       perf_mode_(perf_mode_from_options(options)),
       text_tokenizer_(assets_),
       talker_(assets_->config.talker),
@@ -319,6 +327,7 @@ Qwen3TTSSession::Qwen3TTSSession(
             key != "qwen3_tts.speech_decoder_weight_type" &&
             key != "qwen3_tts.voice_prompt_cache_slots" &&
             key != "qwen3_tts.speaker_embedding_cache_slots" &&
+            key != "qwen3_tts.custom_voice_icl" &&
             key != "qwen3_tts.perf_mode" &&
             key != "qwen3_tts.mem_saver") {
             throw std::runtime_error("unknown Qwen3 TTS session option: " + key);
@@ -370,14 +379,29 @@ Qwen3TTSSession::Qwen3TTSSession(
     if (assets_->config.variant == Qwen3TTSVariant::CustomVoice && task_.task != runtime::VoiceTaskKind::Tts) {
         throw std::runtime_error("Qwen3 custom voice model only supports the Tts task");
     }
-    if (assets_->config.variant == Qwen3TTSVariant::Base) {
-        speech_encoder_ = std::make_unique<Qwen3SpeechTokenizerEncoderRuntime>(
-            assets_,
-            voice_prompt_context_,
-            speech_encoder_graph_arena_bytes_,
-            speech_encoder_weight_storage_type_,
-            conv_weight_storage_type_,
-            perf_mode_);
+    if (assets_->config.variant == Qwen3TTSVariant::Base ||
+        (assets_->config.variant == Qwen3TTSVariant::CustomVoice && custom_voice_icl_)) {
+        try {
+            speech_encoder_ = std::make_unique<Qwen3SpeechTokenizerEncoderRuntime>(
+                assets_,
+                voice_prompt_context_,
+                speech_encoder_graph_arena_bytes_,
+                speech_encoder_weight_storage_type_,
+                conv_weight_storage_type_,
+                perf_mode_);
+        } catch (const std::exception & ex) {
+            if (assets_->config.variant == Qwen3TTSVariant::Base) {
+                throw;
+            }
+            // ICL cloning was requested but this CustomVoice package lacks the
+            // speech-tokenizer encoder; keep the embedding path working and
+            // make the reason visible.
+            std::fprintf(
+                stderr,
+                "[qwen3_tts] speech tokenizer encoder unavailable, custom_voice_icl disabled: %s\n",
+                ex.what());
+            speech_encoder_.reset();
+        }
     }
     if (assets_->config.variant == Qwen3TTSVariant::Base
         || assets_->config.variant == Qwen3TTSVariant::CustomVoice) {
@@ -473,7 +497,11 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
         return result;
     }
-    if (assets_->config.variant == Qwen3TTSVariant::CustomVoice) {
+    const bool custom_voice_icl_active =
+        assets_->config.variant == Qwen3TTSVariant::CustomVoice &&
+        custom_voice_icl_ && speech_encoder_ != nullptr && speaker_encoder_ != nullptr &&
+        make_request(chunk_requests.front()).voice_clone.has_value();
+    if (assets_->config.variant == Qwen3TTSVariant::CustomVoice && !custom_voice_icl_active) {
         Qwen3TTSCustomVoicePromptBuilder prompt_builder(
             text_tokenizer_,
             speaker_encoder_.get(),
@@ -566,7 +594,13 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         }
         prompt_ms += engine::debug::elapsed_ms(prompt_start, Clock::now());
         const auto prefill_start = Clock::now();
-        const auto prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
+        auto prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
+        // CustomVoice requests routed through the ICL path keep their style
+        // instruction; the talker prepends it in front of the ICL layout.
+        if (qwen_request.custom_voice.has_value() && !qwen_request.custom_voice->instruct.empty()) {
+            prefill.instruct_ids =
+                text_tokenizer_.encode(text_tokenizer_.build_instruct_prompt(qwen_request.custom_voice->instruct));
+        }
         prefill_ms += engine::debug::elapsed_ms(prefill_start, Clock::now());
         if (!voice_prompt.reference_codes.has_value()) {
             throw std::runtime_error("Qwen3 base TTS talker currently requires ICL reference codes");
@@ -863,7 +897,11 @@ std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runti
         }
         return items;
     }
-    if (assets_->config.variant == Qwen3TTSVariant::CustomVoice) {
+    const bool custom_voice_icl_active =
+        assets_->config.variant == Qwen3TTSVariant::CustomVoice &&
+        custom_voice_icl_ && speech_encoder_ != nullptr && speaker_encoder_ != nullptr &&
+        make_request(chunk_requests.front()).voice_clone.has_value();
+    if (assets_->config.variant == Qwen3TTSVariant::CustomVoice && !custom_voice_icl_active) {
         Qwen3TTSCustomVoicePromptBuilder prompt_builder(
             text_tokenizer_,
             speaker_encoder_.get(),
@@ -926,6 +964,10 @@ std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runti
         const Qwen3TTSRequest qwen_request = make_request(chunk_request);
         Qwen3TalkerBatchItem item;
         item.prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
+        if (qwen_request.custom_voice.has_value() && !qwen_request.custom_voice->instruct.empty()) {
+            item.prefill.instruct_ids =
+                text_tokenizer_.encode(text_tokenizer_.build_instruct_prompt(qwen_request.custom_voice->instruct));
+        }
         item.options = qwen_request.generation;
         item.repetition_penalty = qwen_request.generation.repetition_penalty;
         validate_batch_item(item.prefill, item.options);
@@ -937,13 +979,15 @@ std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runti
 runtime::AudioBuffer Qwen3TTSSession::decode_batch_codes(
     const Qwen3TalkerBatchItem & item,
     const Qwen3TalkerCodes & codes) {
-    if (assets_->config.variant == Qwen3TTSVariant::Base) {
-        if (!item.prefill.reference_codes.has_value()) {
-            throw std::runtime_error("Qwen3 base TTS batch decode requires reference codes");
-        }
+    // ICL prompts (Base always, CustomVoice with custom_voice_icl) decode the
+    // reference together with the generation and trim it off afterwards.
+    if (item.prefill.reference_codes.has_value()) {
         return speech_decoder_->decode_and_trim_reference(
             *item.prefill.reference_codes,
             codes.generated_codes);
+    }
+    if (assets_->config.variant == Qwen3TTSVariant::Base) {
+        throw std::runtime_error("Qwen3 base TTS batch decode requires reference codes");
     }
     return speech_decoder_->decode(codes.generated_codes);
 }
@@ -1069,6 +1113,19 @@ Qwen3TTSRequest Qwen3TTSSession::make_request(const runtime::TaskRequest & reque
             const auto tag = request.voice->style->tags.find("instruct");
             if (tag != request.voice->style->tags.end()) {
                 custom_voice.instruct = tag->second;
+            }
+        }
+        // Experimental ICL cloning: with reference audio plus transcript the
+        // request can run through the Base voice-clone prompt, which anchors
+        // register and prosody on the actual reference codes instead of the
+        // embedding row alone.
+        if (custom_voice_icl_ && custom_voice.reference_audio.has_value()) {
+            if (const auto reference_text = runtime::find_option(request.options, {"reference_text"})) {
+                Qwen3VoiceCloneInput voice_clone;
+                voice_clone.reference_audio = *custom_voice.reference_audio;
+                voice_clone.reference_text = *reference_text;
+                voice_clone.mode = Qwen3VoiceCloneMode::Icl;
+                out.voice_clone = std::move(voice_clone);
             }
         }
         out.custom_voice = std::move(custom_voice);

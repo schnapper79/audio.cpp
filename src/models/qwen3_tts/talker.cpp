@@ -562,6 +562,18 @@ PromptEmbeddingState build_prompt_state(
 
     PromptEmbeddingState state;
     state.tts_pad = tts_pad;
+    // Instruct rows sit in front of the ICL prompt at the same position the
+    // CustomVoice/VoiceDesign layouts put them, so cloned-with-instruct
+    // requests keep their style control when the ICL path is used.
+    if (!prefill.instruct_ids.empty()) {
+        append_rows(
+            state.prompt,
+            text_project_host(
+                lookup_rows(weights.text_embedding, config.text_hidden_size, prefill.instruct_ids),
+                static_cast<int64_t>(prefill.instruct_ids.size()),
+                weights,
+                config));
+    }
     const std::vector<int32_t> role_ids(prefill.input_ids.begin(), prefill.input_ids.begin() + 3);
     append_rows(state.prompt, text_project_host(lookup_rows(weights.text_embedding, config.text_hidden_size, role_ids), 3, weights, config));
 

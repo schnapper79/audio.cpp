@@ -101,6 +101,11 @@ private:
     engine::assets::TensorStorageType speech_decoder_weight_storage_type_ = engine::assets::TensorStorageType::Native;
     engine::assets::TensorStorageType conv_weight_storage_type_ = engine::assets::TensorStorageType::F32;
     bool mem_saver_ = false;
+    // Experimental: clone CustomVoice speakers through the Base ICL prompt
+    // (reference audio codes + transcript in context) instead of the
+    // embedding-only row. Requires the package to ship the speech-tokenizer
+    // encoder and the request to carry voice_ref + reference_text.
+    bool custom_voice_icl_ = false;
     Qwen3TTSPerfMode perf_mode_ = Qwen3TTSPerfMode::Standard;
     Qwen3TextTokenizer text_tokenizer_;
     Qwen3Talker talker_;

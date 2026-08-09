@@ -187,6 +187,13 @@
         "default": 1
       },
       {
+        "name": "custom_voice_icl",
+        "type": "bool",
+        "description": "Experimental: clone CustomVoice speakers through the Base ICL prompt (reference audio codes + transcript in context) instead of the embedding row alone. Requires voice_ref plus reference_text on the request and speech-tokenizer encoder weights in the package; the reference language must match the target language. Anchors register and pitch per chunk (measured: within-sentence pitch drift -4.0 -> +0.6 semitones); style instructions are prepended and remain intelligible. Default false.",
+        "required": false,
+        "default": false
+      },
+      {
         "name": "speaker_embedding_cache_slots",
         "type": "int",
         "description": "Cloned-voice speaker embeddings cached by reference-audio hash; default 1024. An entry is one hidden_size embedding (~8 KB), so the default costs a few megabytes and spares the CPU-side speaker encoder pass for every previously seen clip. 0 disables caching.",
