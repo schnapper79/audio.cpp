@@ -712,18 +712,31 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
     double talker_ms = 0.0;
     double decoder_ms = 0.0;
     runtime::AudioBuffer merged_audio;
+    // Hybrid cloning: an explicitly supplied embedding replaces the x-vector
+    // computed from the reference WAV while the reference codes stay in the
+    // context - timbre from one voice, delivery/accent from the reference.
+    // Without an explicit embedding nothing changes.
+    const auto embedding_override = resolve_embedding_override(request);
     for (const auto & chunk_request : chunk_requests) {
         const Qwen3TTSRequest qwen_request = make_request(chunk_request);
         const auto prompt_start = Clock::now();
-        const auto & voice_prompt = resolve_voice_prompt(*qwen_request.voice_clone, prompt_builder);
+        const auto & cached_prompt = resolve_voice_prompt(*qwen_request.voice_clone, prompt_builder);
         // Sprecher-Embedding auf Wunsch herausschreiben. Es entsteht hier
         // ohnehin; ohne diesen Ausgang gaebe es keinen Weg, den Vektor einer
-        // Stimme aufzubewahren - CustomVoice erwartet genau ihn.
+        // Stimme aufzubewahren - CustomVoice erwartet genau ihn. Bewusst der
+        // Vektor DER REFERENZ, nicht der Override: der Ausgang ist Extraktion.
         if (const auto path = runtime::find_option(
                 chunk_request.options,
                 {"speaker_embedding_out"})) {
-            write_speaker_embedding(*path, voice_prompt.speaker_embedding);
+            write_speaker_embedding(*path, cached_prompt.speaker_embedding);
         }
+        std::optional<Qwen3VoiceClonePrompt> hybrid_prompt;
+        if (embedding_override.has_value()) {
+            hybrid_prompt = cached_prompt;
+            hybrid_prompt->speaker_embedding = *embedding_override;
+        }
+        const Qwen3VoiceClonePrompt & voice_prompt =
+            hybrid_prompt.has_value() ? *hybrid_prompt : cached_prompt;
         prompt_ms += engine::debug::elapsed_ms(prompt_start, Clock::now());
         const auto prefill_start = Clock::now();
         auto prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
@@ -929,6 +942,29 @@ std::vector<runtime::BatchedTaskResult> Qwen3TTSSession::run_batch(
 // speaker_embedding_out writes - and validates it against the talker width.
 // Feeding a stored or arithmetically mixed vector this way replaces the
 // reference-WAV + encoder path entirely.
+// An explicitly supplied speaker embedding (inline in the request or as a
+// speaker_embedding_in file); nullopt when the request carries none. Shared by
+// the embedding-only path and the ICL hybrid: an explicit vector always names
+// the timbre the caller wants, wherever the reference audio comes from.
+std::optional<Qwen3SpeakerEmbedding> Qwen3TTSSession::resolve_embedding_override(
+    const runtime::TaskRequest & request) const {
+    if (request.voice.has_value() && request.voice->speaker.has_value() &&
+        request.voice->speaker->embedding.has_value()) {
+        const auto & values = *request.voice->speaker->embedding;
+        const int64_t hidden = assets_->config.talker.hidden_size;
+        if (static_cast<int64_t>(values.size()) != hidden) {
+            throw std::runtime_error(
+                "speaker embedding has " + std::to_string(values.size()) +
+                " values, expected " + std::to_string(hidden));
+        }
+        return Qwen3SpeakerEmbedding{values, hidden};
+    }
+    if (const auto embedding_in = runtime::find_option(request.options, {"speaker_embedding_in"})) {
+        return load_speaker_embedding_file(*embedding_in);
+    }
+    return std::nullopt;
+}
+
 Qwen3SpeakerEmbedding Qwen3TTSSession::load_speaker_embedding_file(const std::string & path) const {
     std::FILE * in = std::fopen(path.c_str(), "rb");
     if (in == nullptr) {
@@ -1131,10 +1167,22 @@ std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runti
         assets_->config.talker.max_position_embeddings);
     // Resolved once per request and consumed before the next request resolves;
     // the returned reference points into a slot cache a later resolve may evict.
-    const auto & voice_prompt = resolve_voice_prompt(*first_request.voice_clone, prompt_builder);
+    const auto & cached_prompt = resolve_voice_prompt(*first_request.voice_clone, prompt_builder);
     if (embedding_out_path.has_value()) {
-        write_speaker_embedding(*embedding_out_path, voice_prompt.speaker_embedding);
+        // The reference's own vector, not a supplied override - this output
+        // is extraction, and extracting what the caller already has would be
+        // a no-op.
+        write_speaker_embedding(*embedding_out_path, cached_prompt.speaker_embedding);
     }
+    // Hybrid cloning, same as the single path: a supplied embedding names the
+    // timbre, the reference codes keep steering delivery and accent.
+    std::optional<Qwen3VoiceClonePrompt> hybrid_prompt;
+    if (const auto embedding_override = resolve_embedding_override(request)) {
+        hybrid_prompt = cached_prompt;
+        hybrid_prompt->speaker_embedding = *embedding_override;
+    }
+    const Qwen3VoiceClonePrompt & voice_prompt =
+        hybrid_prompt.has_value() ? *hybrid_prompt : cached_prompt;
     if (!voice_prompt.reference_codes.has_value()) {
         throw std::runtime_error("Qwen3 base TTS talker currently requires ICL reference codes");
     }

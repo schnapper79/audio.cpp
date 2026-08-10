@@ -80,6 +80,7 @@ private:
         const Qwen3TTSVoiceClonePromptBuilder & prompt_builder);
     void write_speaker_embedding(const std::string & path, const Qwen3SpeakerEmbedding & embedding) const;
     Qwen3SpeakerEmbedding load_speaker_embedding_file(const std::string & path) const;
+    std::optional<Qwen3SpeakerEmbedding> resolve_embedding_override(const runtime::TaskRequest & request) const;
     Qwen3SpeakerEmbedding resolve_custom_voice_embedding(const runtime::AudioBuffer & reference_audio);
     void validate_batch_item(const Qwen3TalkerPrefill & prefill, const Qwen3TTSGenerationOptions & options) const;
     std::vector<Qwen3TalkerBatchItem> build_batch_items(const runtime::TaskRequest & request);
