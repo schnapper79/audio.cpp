@@ -30,6 +30,12 @@ struct Qwen3TalkerPrefill {
     std::string language = "Auto";
     bool icl_mode = false;
     bool x_vector_only_mode = false;
+    // ICL layout only: how many copies of the speaker-embedding row the
+    // prompt carries. One row is the trained layout; more rows shift the
+    // identity contest toward the embedding when it deliberately differs
+    // from the reference codes (hybrid cloning: timbre from the embedding,
+    // accent/delivery from the codes).
+    int64_t speaker_embedding_repeat = 1;
     // Register priming: these frames are force-fed as the start of the
     // generation instead of being sampled, so every chunk begins in the same
     // acoustic state (register, energy) before free generation continues. The

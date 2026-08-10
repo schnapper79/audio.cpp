@@ -717,6 +717,8 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
     // context - timbre from one voice, delivery/accent from the reference.
     // Without an explicit embedding nothing changes.
     const auto embedding_override = resolve_embedding_override(request);
+    const int64_t speaker_embedding_repeat = std::clamp<int64_t>(
+        runtime::parse_i64_option(request.options, {"speaker_embedding_repeat"}).value_or(1), 1, 64);
     for (const auto & chunk_request : chunk_requests) {
         const Qwen3TTSRequest qwen_request = make_request(chunk_request);
         const auto prompt_start = Clock::now();
@@ -740,6 +742,7 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         prompt_ms += engine::debug::elapsed_ms(prompt_start, Clock::now());
         const auto prefill_start = Clock::now();
         auto prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
+        prefill.speaker_embedding_repeat = speaker_embedding_repeat;
         // CustomVoice requests routed through the ICL path keep their style
         // instruction; the talker prepends it in front of the ICL layout.
         if (qwen_request.custom_voice.has_value() && !qwen_request.custom_voice->instruct.empty()) {
@@ -1183,6 +1186,8 @@ std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runti
     }
     const Qwen3VoiceClonePrompt & voice_prompt =
         hybrid_prompt.has_value() ? *hybrid_prompt : cached_prompt;
+    const int64_t speaker_embedding_repeat = std::clamp<int64_t>(
+        runtime::parse_i64_option(request.options, {"speaker_embedding_repeat"}).value_or(1), 1, 64);
     if (!voice_prompt.reference_codes.has_value()) {
         throw std::runtime_error("Qwen3 base TTS talker currently requires ICL reference codes");
     }
@@ -1190,6 +1195,7 @@ std::vector<Qwen3TalkerBatchItem> Qwen3TTSSession::build_batch_items(const runti
         const Qwen3TTSRequest qwen_request = make_request(chunk_request);
         Qwen3TalkerBatchItem item;
         item.prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
+        item.prefill.speaker_embedding_repeat = speaker_embedding_repeat;
         if (qwen_request.custom_voice.has_value() && !qwen_request.custom_voice->instruct.empty()) {
             item.prefill.instruct_ids =
                 text_tokenizer_.encode(text_tokenizer_.build_instruct_prompt(qwen_request.custom_voice->instruct));

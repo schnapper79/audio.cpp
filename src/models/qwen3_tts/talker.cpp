@@ -120,6 +120,7 @@ bool talker_prefill_equal(const Qwen3TalkerPrefill & lhs, const Qwen3TalkerPrefi
         lhs.language != rhs.language ||
         lhs.icl_mode != rhs.icl_mode ||
         lhs.x_vector_only_mode != rhs.x_vector_only_mode ||
+        lhs.speaker_embedding_repeat != rhs.speaker_embedding_repeat ||
         lhs.reference_codes.has_value() != rhs.reference_codes.has_value() ||
         lhs.primer_codes.has_value() != rhs.primer_codes.has_value() ||
         lhs.speaker_embedding.has_value() != rhs.speaker_embedding.has_value()) {
@@ -582,7 +583,10 @@ PromptEmbeddingState build_prompt_state(
     append_rows(state.prompt, text_project_host(lookup_rows(weights.text_embedding, config.text_hidden_size, role_ids), 3, weights, config));
 
     auto codec_embed = lookup_rows(weights.codec_embedding, config.hidden_size, codec_prefix);
-    append_row(codec_embed, prefill.speaker_embedding->values);
+    const int64_t speaker_rows = std::max<int64_t>(prefill.speaker_embedding_repeat, 1);
+    for (int64_t row = 0; row < speaker_rows; ++row) {
+        append_row(codec_embed, prefill.speaker_embedding->values);
+    }
     append_rows(codec_embed, lookup_rows(
                                  weights.codec_embedding,
                                  config.hidden_size,
