@@ -394,8 +394,15 @@ public:
         }
     }
 
+    // Exact frame count, not >=: attentive statistics pooling averages over
+    // every column of the graph, so a reused wider graph folds its zero
+    // padding into the embedding. That made the vector depend on the longest
+    // clip the session had encoded before it - the same WAV produced different
+    // embeddings across runs (cosine down to 0.974 against the unpadded
+    // result). Rebuilding per length costs a few ms and each clip is encoded
+    // once anyway, the results are cached upstream.
     bool matches(const Qwen3SpeakerEncoderWeights & weights, int64_t frames, ggml_backend_t backend, int threads) const {
-        return weights_.get() == &weights && frames_ >= frames && backend_ == backend && compute_threads_ == std::max(1, threads);
+        return weights_.get() == &weights && frames_ == frames && backend_ == backend && compute_threads_ == std::max(1, threads);
     }
 
     std::vector<float> run(const audio::AudioTensor & features) {
@@ -403,16 +410,10 @@ public:
             throw std::runtime_error("Qwen3 speaker feature tensor has invalid shape");
         }
         const int64_t valid_frames = features.shape[2];
-        if (valid_frames > frames_) {
-            throw std::runtime_error("Qwen3 speaker feature tensor exceeds graph capacity");
+        if (valid_frames != frames_) {
+            throw std::runtime_error("Qwen3 speaker feature tensor does not match the graph frame count");
         }
-        std::vector<float> padded(static_cast<size_t>(kFeatureDim * frames_), 0.0F);
-        for (int64_t c = 0; c < kFeatureDim; ++c) {
-            for (int64_t t = 0; t < valid_frames; ++t) {
-                padded[static_cast<size_t>(c * frames_ + t)] = features.values[static_cast<size_t>(c * valid_frames + t)];
-            }
-        }
-        ggml_backend_tensor_set(input_, padded.data(), 0, padded.size() * sizeof(float));
+        ggml_backend_tensor_set(input_, features.values.data(), 0, features.values.size() * sizeof(float));
         core::set_backend_threads(backend_, compute_threads_);
         const ggml_status status = engine::core::compute_backend_graph(backend_, graph_);
         ggml_backend_synchronize(backend_);
