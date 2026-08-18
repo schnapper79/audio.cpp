@@ -44,6 +44,18 @@ public:
     OmniVoiceGeneratedAudioTokens generate(
         const OmniVoicePrompt & prompt,
         const OmniVoiceGenerationOptions & options);
+
+    // Mehrere Prompts gemeinsam durch die Masken-Diffusion ziehen. Omnivoice
+    // ist kein AR-Modell: jede Anfrage packt ihre Sequenz in EINE Batch-Achse
+    // (CFG braucht ohnehin zwei Bahnen), und der Stapel verbreitert diese Achse
+    // von 2 auf 2*N Bahnen - jedes Gewichtslesen der vollen Vorwaertslaeufe
+    // bedient dann alle Anfragen gleichzeitig. Der Zufallsgenerator und der
+    // Entmaskungs-Zeitplan bleiben je Anfrage isoliert; options[i].seed
+    // steuert Bahn i direkt (statt des shared Zustands im Einzelpfad).
+    std::vector<OmniVoiceGeneratedAudioTokens> generate_batch(
+        const std::vector<OmniVoicePrompt> & prompts,
+        const std::vector<OmniVoiceGenerationOptions> & options);
+
     void release_runtime_graphs();
     void seed_rng(uint32_t seed);
     const OmniVoiceGeneratorRuntimeStats & last_stats() const noexcept;

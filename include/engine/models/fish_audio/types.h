@@ -9,6 +9,19 @@
 
 namespace engine::models::fish_audio {
 
+// Wo im Tensor die Sequenzen eines Stapels nebeneinander liegen.
+//
+// Token:   in ggml ne[1]. Ein Gewichtslesen bedient alle Sequenzen, weil
+//          ncols_dst gleich ne[1] ist. Dafuer wechselt ggml oberhalb von vier
+//          Spalten die Warp-Aufteilung, und die Summen laufen anders.
+// Channel: in ggml ne[2]. ncols_dst bleibt 1, die Warp-Regel greift also nie
+//          und der Stapel darf groesser werden -- aber jede Sequenz liest die
+//          Gewichte erneut. So stapeln higgs_audio_tts und qwen3_tts.
+enum class FishAudioBatchAxis {
+    Token,
+    Channel,
+};
+
 struct FishAudioGenerationOptions {
     int64_t max_new_tokens = 1024;
     int64_t text_chunk_size = 200;

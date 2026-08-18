@@ -22,7 +22,7 @@ namespace engine::models::omnivoice {
 
 class OmniVoiceSession final
     : public runtime::RuntimeSessionBase
-    , public runtime::IOfflineVoiceTaskSession
+    , public runtime::IBatchedOfflineVoiceTaskSession
     , public runtime::IStreamingVoiceTaskSession {
 public:
     OmniVoiceSession(
@@ -35,6 +35,9 @@ public:
     runtime::RunMode run_mode() const override;
     void prepare(const runtime::SessionPreparationRequest & request) override;
     runtime::TaskResult run(const runtime::TaskRequest & request) override;
+    int64_t max_batch_size() const override;
+    std::vector<runtime::BatchedTaskResult> run_batch(
+        const std::vector<runtime::TaskRequest> & requests) override;
     runtime::StreamingPolicy streaming_policy() const override;
     void start_stream(const runtime::TaskRequest & request) override;
     std::optional<runtime::StreamEvent> next_stream_event() override;
@@ -103,6 +106,11 @@ private:
     int64_t stream_chunk_codebooks_ = 0;
     bool stream_started_ = false;
     bool stream_has_reference_audio_ = false;
+
+    // Wieviele Anfragen ein Stapel umfasst (omnivoice.max_batch, Vorgabe 1 =
+    // Einzelpfad wie bisher). memory-gebundener Deckel wie bei higgs; die
+    // Batch-Achse traegt 2*max_batch Bahnen (CFG inclusive).
+    int64_t max_batch_size_ = 1;
 };
 
 }  // namespace engine::models::omnivoice

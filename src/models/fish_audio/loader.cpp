@@ -41,10 +41,14 @@ runtime::ModelCliInterface cli(const FishAudioAssets &) {
         {"top_k", "N", "Top-k sampling value."},
         {"temperature", "FLOAT", "Sampling temperature."},
         {"seed", "N", "Sampling seed for reproducible output; omitted uses a random seed."},
+        {"context_id", "TEXT", "Carry the previous turn across requests under this id (e.g. one per speaker)."},
+        {"context_reset", "true|false", "Drop the carried turn for context_id before generating; use at chapter start."},
+        {"chunk_context", "true|false", "Condition each text chunk on the previous chunk's audio; default true. False keeps every chunk anchored on the reference alone."},
     };
     out.session_options = {
         {"fish_audio.mem_saver", "true|false", "Release cached AR runtime graphs after each request; default false."},
         {"fish_audio.reference_cache_slots", "n", "Prepared reference-audio cache slots; default 1."},
+        {"fish_audio.context_slots", "n", "How many context_id histories to keep; default 16, 0 disables."},
         {"fish_audio.weight_type", "native|f32|f16|bf16|q8_0", "AR matmul weight storage type; default native."},
         {"fish_audio.codec_weight_type", "native|f32|f16|q8_0", "Codec conv/matmul weight storage type; default native."},
     };

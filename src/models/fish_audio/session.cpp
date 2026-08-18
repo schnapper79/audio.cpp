@@ -31,6 +31,9 @@ constexpr size_t kDefaultCodecGraphArenaBytes = 512ull * 1024ull * 1024ull;
 constexpr size_t kDefaultArWeightContextBytes = 512ull * 1024ull * 1024ull;
 constexpr size_t kDefaultCodecWeightContextBytes = 512ull * 1024ull * 1024ull;
 constexpr int64_t kDefaultReferenceCacheSlots = 1;
+// Wieviele Rollen gleichzeitig ein Gedaechtnis behalten. Ein Kapitel hat selten
+// mehr als ein Dutzend Sprecher; wer darueber hinaus faellt, faengt neu an.
+constexpr int64_t kDefaultContextSlots = 16;
 constexpr const char * kReferenceTextOption = "reference_text";
 
 std::shared_ptr<const FishAudioAssets> require_assets(std::shared_ptr<const FishAudioAssets> assets) {
@@ -91,6 +94,48 @@ std::size_t resolve_reference_cache_slots(const runtime::SessionOptions & option
         throw std::runtime_error("fish_audio.reference_cache_slots is too large");
     }
     return static_cast<std::size_t>(slots);
+}
+
+std::size_t resolve_context_slots(const runtime::SessionOptions & options) {
+    const int64_t slots = runtime::parse_i64_option(
+        options.options,
+        {"fish_audio.context_slots", "context_slots"})
+        .value_or(kDefaultContextSlots);
+    if (slots < 0) {
+        throw std::runtime_error("fish_audio.context_slots must be non-negative");
+    }
+    return static_cast<std::size_t>(slots);
+}
+
+// Auf der Token-Achse wechselt ggml oberhalb von vier Sequenzen die
+// Warp-Aufteilung seiner CUDA-Matmuls (calc_nwarps in ggml-cuda/mmvq.cu: 4 fuer
+// ncols_dst 1..4, danach 2). Die Summen laufen dann in anderer Reihenfolge, und
+// dieselbe Zeile klaenge im Stapel anders als allein. Weil der Seed je Sequenz
+// gelten muss, wird dort gedeckelt statt schneller zu werden.
+constexpr int64_t kMaxExactTokenBatchSize = 4;
+// Auf der Kanal-Achse bleibt ncols_dst 1, die Warp-Regel greift also nie. Der
+// Deckel hier ist Vorsicht vor dem Speicher -- der KV-Speicher waechst mit der
+// Zahl der Bahnen -- und folgt higgs_audio_tts.
+constexpr int64_t kMaxChannelBatchSize = 8;
+
+int64_t resolve_max_batch_size(const runtime::SessionOptions & options) {
+    const int64_t size = runtime::parse_i64_option(options.options, {"fish_audio.max_batch", "max_batch"})
+                             .value_or(1);
+    if (size < 1) {
+        throw std::runtime_error("fish_audio.max_batch must be at least 1");
+    }
+    return size;
+}
+
+FishAudioBatchAxis resolve_batch_axis(const runtime::SessionOptions & options) {
+    const auto value = runtime::find_option(options.options, {"fish_audio.batch_axis", "batch_axis"});
+    if (!value.has_value() || *value == "token") {
+        return FishAudioBatchAxis::Token;
+    }
+    if (*value == "channel") {
+        return FishAudioBatchAxis::Channel;
+    }
+    throw std::runtime_error("fish_audio.batch_axis must be 'token' or 'channel'");
 }
 
 uint64_t mix_reference_key(uint64_t key, uint64_t value) {
@@ -272,9 +317,27 @@ FishAudioSession::FishAudioSession(
     : RuntimeSessionBase(options),
       task_(task),
       assets_(require_assets(std::move(assets))),
-      reference_cache_(resolve_reference_cache_slots(this->options())) {
+      reference_cache_(resolve_reference_cache_slots(this->options())),
+      carried_capacity_(resolve_context_slots(this->options())) {
     if (task_.task != runtime::VoiceTaskKind::Tts || task_.mode != runtime::RunMode::Offline) {
         throw std::runtime_error("Fish Audio only supports offline TTS sessions");
+    }
+    max_batch_size_ = resolve_max_batch_size(options);
+    batch_axis_ = resolve_batch_axis(options);
+    const int64_t ceiling =
+        batch_axis_ == FishAudioBatchAxis::Token ? kMaxExactTokenBatchSize : kMaxChannelBatchSize;
+    if (max_batch_size_ > ceiling) {
+        engine::debug::log_message(
+            engine::debug::LogLevel::Warning,
+            "fish_audio",
+            "fish_audio.max_batch=" + std::to_string(max_batch_size_) + " exceeds " +
+                std::to_string(ceiling) + " for batch_axis=" +
+                (batch_axis_ == FishAudioBatchAxis::Token ? "token" : "channel") + "; clamping" +
+                (batch_axis_ == FishAudioBatchAxis::Token
+                     ? ", because above that ggml changes its matmul warp split and the same seed would no "
+                       "longer sound the same alone as inside a batch"
+                     : ""));
+        max_batch_size_ = ceiling;
     }
     const auto ar_weight_type =
         option_weight_type(options, "fish_audio.weight_type", assets::TensorStorageType::Native);
@@ -375,6 +438,29 @@ FishAudioRequest FishAudioSession::make_request(const runtime::TaskRequest & req
     return out;
 }
 
+void FishAudioSession::forget_context(const std::string & id) {
+    carried_turns_.erase(id);
+    const auto it = std::find(carried_order_.begin(), carried_order_.end(), id);
+    if (it != carried_order_.end()) {
+        carried_order_.erase(it);
+    }
+}
+
+void FishAudioSession::remember_context(const std::string & id, FishAudioConversationTurn turn) {
+    if (carried_capacity_ == 0) {
+        return;
+    }
+    if (carried_turns_.find(id) == carried_turns_.end()) {
+        carried_order_.push_back(id);
+    }
+    carried_turns_.insert_or_assign(id, std::move(turn));
+    while (carried_order_.size() > carried_capacity_) {
+        const auto oldest = carried_order_.front();
+        carried_order_.pop_front();
+        carried_turns_.erase(oldest);
+    }
+}
+
 const FishAudioCodes & FishAudioSession::resolve_reference_codes(const FishAudioReference & reference) {
     ReferenceCacheKey key;
     key.source_id = reference.cache_id;
@@ -435,9 +521,39 @@ runtime::TaskResult FishAudioSession::run(const runtime::TaskRequest & request) 
     engine::debug::trace_log_scalar("fish_audio.text_chunk_mode", engine::text::text_chunk_mode_name(text_chunk_mode));
     engine::debug::trace_log_scalar("fish_audio.text_chunk_count", static_cast<int64_t>(chunk_requests.size()));
 
+    // Kontext ueber Anfragen hinweg: der Aufrufer gibt eine Kennung mit (in der
+    // Regel die Rolle), und der letzte Zug dieser Kennung wird als Vorgeschichte
+    // in den naechsten Prompt gehaengt. Ohne Kennung bleibt alles wie vorher.
+    const auto context_id =
+        runtime::find_option(request.options, {"fish_audio.context_id", "context_id"})
+            .value_or(std::string{});
+    const auto reset_value =
+        runtime::find_option(request.options, {"fish_audio.context_reset", "context_reset"});
+    const bool context_reset =
+        reset_value.has_value() && runtime::parse_bool_option(*reset_value, "fish_audio.context_reset");
+    if (!context_id.empty() && context_reset) {
+        forget_context(context_id);
+    }
+    // Auch innerhalb einer Anfrage haengt ab dem zweiten Stueck die eigene
+    // Ausgabe im Prompt. Bei langer Erzaehlung sind das schnell ein Dutzend
+    // Stuecke, und die Stimme sinkt dabei ab: gemessen 148 Hz statt 158, und
+    // Melodie 31 statt 37. Wer die Vorlage wichtiger findet als den
+    // Zusammenhang, schaltet es hiermit aus.
+    const auto chunk_value =
+        runtime::find_option(request.options, {"fish_audio.chunk_context", "chunk_context"});
+    const bool chunk_context =
+        !chunk_value.has_value() || runtime::parse_bool_option(*chunk_value, "fish_audio.chunk_context");
+
     runtime::AudioBuffer merged_audio;
     std::optional<FishAudioCodes> reference_codes = std::nullopt;
     std::optional<FishAudioConversationTurn> previous_turn = std::nullopt;
+    if (!context_id.empty()) {
+        if (const auto it = carried_turns_.find(context_id); it != carried_turns_.end()) {
+            previous_turn = it->second;
+        }
+        engine::debug::trace_log_scalar("fish_audio.context.carried", previous_turn.has_value() ? 1 : 0);
+        engine::debug::trace_log_scalar("fish_audio.context.entries", static_cast<int64_t>(carried_turns_.size()));
+    }
     for (size_t chunk_index = 0; chunk_index < chunk_requests.size(); ++chunk_index) {
         const auto & chunk_request = chunk_requests[chunk_index];
         auto fish_request = make_request(chunk_request);
@@ -446,14 +562,123 @@ runtime::TaskResult FishAudioSession::run(const runtime::TaskRequest & request) 
         }
         auto generated = generator_->generate(fish_request, reference_codes, previous_turn, mem_saver);
         runtime::append_audio_buffer(merged_audio, generated.audio);
-        if (chunk_requests.size() > 1) {
+        // Bisher wurde der Zug nur gemerkt, wenn es ueberhaupt mehrere Stuecke
+        // gab. Mit Kontext-Kennung braucht auch das letzte Stueck einer Anfrage
+        // sein Gedaechtnis, sonst hat die naechste Anfrage nichts zu erben.
+        if (!chunk_context) {
+            previous_turn = std::nullopt;
+        } else if (chunk_requests.size() > 1 || !context_id.empty()) {
             previous_turn = FishAudioConversationTurn{fish_request.text, std::move(generated.codes)};
         }
+    }
+    if (!context_id.empty() && previous_turn.has_value()) {
+        remember_context(context_id, std::move(*previous_turn));
     }
     runtime::TaskResult result;
     result.audio_output = std::move(merged_audio);
     engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
     return result;
+}
+
+int64_t FishAudioSession::max_batch_size() const {
+    return max_batch_size_;
+}
+
+std::vector<runtime::BatchedTaskResult> FishAudioSession::run_batch(
+    const std::vector<runtime::TaskRequest> & requests) {
+    require_prepared("Fish Audio run_batch()");
+    std::vector<runtime::BatchedTaskResult> results(requests.size());
+    if (requests.empty()) {
+        return results;
+    }
+    if (max_batch_size_ <= 1) {
+        for (size_t index = 0; index < requests.size(); ++index) {
+            try {
+                results[index].result = run(requests[index]);
+            } catch (const std::exception & ex) {
+                results[index].error = ex.what();
+            }
+        }
+        return results;
+    }
+
+    const auto wall_start = Clock::now();
+    const bool mem_saver = mem_saver_from_options(options());
+
+    struct Pending {
+        size_t index = 0;
+        FishAudioRequest request;
+        std::optional<FishAudioCodes> reference;
+    };
+    std::vector<Pending> pending;
+    pending.reserve(static_cast<size_t>(max_batch_size_));
+
+    const auto flush = [&]() {
+        if (pending.empty()) {
+            return;
+        }
+        std::vector<FishAudioRequest> batch_requests;
+        std::vector<std::optional<FishAudioCodes>> batch_references;
+        batch_requests.reserve(pending.size());
+        batch_references.reserve(pending.size());
+        for (const auto & entry : pending) {
+            batch_requests.push_back(entry.request);
+            batch_references.push_back(entry.reference);
+        }
+        try {
+            auto generated =
+                generator_->generate_batch(batch_requests, batch_references, batch_axis_, mem_saver);
+            for (size_t slot = 0; slot < pending.size(); ++slot) {
+                runtime::TaskResult out;
+                out.audio_output = std::move(generated[slot].audio);
+                results[pending[slot].index].result = std::move(out);
+            }
+        } catch (const std::exception & ex) {
+            for (const auto & entry : pending) {
+                results[entry.index].error = ex.what();
+            }
+        }
+        pending.clear();
+    };
+
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const auto & request = requests[index];
+        try {
+            // Nur was allein steht, darf in den Stapel: mehrteilige Texte und
+            // Anfragen mit Kontext-Kennung haengen an ihrer eigenen Vorgeschichte
+            // und wuerden im Stapel eine andere Konditionierung bekommen.
+            const auto request_options = generation_options_from_request(request);
+            const auto text_chunk_mode =
+                engine::text::parse_text_chunk_mode_override(request.options)
+                    .value_or(engine::text::TextChunkMode::Default);
+            const auto chunk_requests =
+                runtime::chunk_text_request(request, request_options.text_chunk_size, text_chunk_mode);
+            const auto context_id =
+                runtime::find_option(request.options, {"fish_audio.context_id", "context_id"})
+                    .value_or(std::string{});
+            if (chunk_requests.size() != 1 || !context_id.empty()) {
+                flush();
+                results[index].result = run(request);
+                continue;
+            }
+            auto fish_request = make_request(chunk_requests.front());
+            std::optional<FishAudioCodes> reference;
+            if (fish_request.reference.has_value()) {
+                reference = resolve_reference_codes(*fish_request.reference);
+            }
+            pending.push_back(Pending{index, std::move(fish_request), std::move(reference)});
+            if (static_cast<int64_t>(pending.size()) >= max_batch_size_) {
+                flush();
+            }
+        } catch (const std::exception & ex) {
+            results[index].error = ex.what();
+        }
+    }
+    flush();
+    engine::debug::trace_log_scalar("fish_audio.run_batch.requests", static_cast<int64_t>(requests.size()));
+    engine::debug::trace_log_scalar("fish_audio.run_batch.max_batch", max_batch_size_);
+    engine::debug::timing_log_scalar("session.batch_wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
+    return results;
 }
 
 }  // namespace engine::models::fish_audio

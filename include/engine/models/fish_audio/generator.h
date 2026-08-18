@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace engine::models::fish_audio {
 
@@ -28,6 +29,14 @@ public:
         const FishAudioRequest & request,
         const std::optional<FishAudioCodes> & reference_codes,
         const std::optional<FishAudioConversationTurn> & previous_turn,
+        bool mem_saver);
+
+    // Zieht mehrere Anfragen gemeinsam durch den AR-Decoder. Der Codec laeuft
+    // danach je Stueck einzeln; er ist nicht der Engpass.
+    std::vector<FishAudioGenerationResult> generate_batch(
+        const std::vector<FishAudioRequest> & requests,
+        const std::vector<std::optional<FishAudioCodes>> & reference_codes,
+        FishAudioBatchAxis axis,
         bool mem_saver);
 
 private:

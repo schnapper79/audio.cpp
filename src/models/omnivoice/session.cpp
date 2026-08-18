@@ -72,6 +72,21 @@ std::string_view perf_mode_name(OmniVoiceGeneratorPerfMode mode) {
     return "unknown";
 }
 
+// Deckel wie bei higgs_audio_tts: die Batch-Achse traegt 2*max_batch Bahnen
+// (CFG inclusive), Aktivierungen und Logit-Puffer wachsen linear damit. Auf
+// einer 4-GB-Karte sind 4 die empfohlene Obergrenze; mehr bringt auf kleinen
+// Karten ohnehin kein Tempo mehr, weil die Aufmerksamkeit mit T^2 waechst.
+constexpr int64_t kMaxOmniVoiceBatchSize = 8;
+
+int64_t resolve_max_batch_size(const runtime::SessionOptions & options) {
+    const int64_t size = runtime::parse_i64_option(options.options, {"omnivoice.max_batch", "max_batch"})
+                             .value_or(1);
+    if (size < 1) {
+        throw std::runtime_error("omnivoice.max_batch must be at least 1");
+    }
+    return std::min(size, kMaxOmniVoiceBatchSize);
+}
+
 using Clock = std::chrono::steady_clock;
 
 OmniVoiceGenerationOptions generation_options_from_options(const std::unordered_map<std::string, std::string> & options_map) {
@@ -241,8 +256,10 @@ OmniVoiceSession::OmniVoiceSession(
           generator_weight_context_bytes_,
           generator_weight_storage_type_,
           mem_saver_,
-          generator_perf_mode_) {
+          generator_perf_mode_),
+      max_batch_size_(resolve_max_batch_size(options)) {
     engine::debug::trace_log_scalar("omnivoice.perf_mode", perf_mode_name(generator_perf_mode_));
+    engine::debug::trace_log_scalar("omnivoice.max_batch", max_batch_size_);
     if (task_.task != runtime::VoiceTaskKind::Tts) {
         throw std::runtime_error("OmniVoice only supports VoiceTaskKind::Tts");
     }
@@ -526,6 +543,126 @@ runtime::TaskResult OmniVoiceSession::run(const runtime::TaskRequest & request) 
     engine::debug::timing_log_scalar("omnivoice.session.postprocess_ms", engine::debug::elapsed_ms(postprocess_start, postprocess_end));
     engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start, postprocess_end));
     return task_result;
+}
+
+int64_t OmniVoiceSession::max_batch_size() const {
+    return max_batch_size_;
+}
+
+std::vector<runtime::BatchedTaskResult> OmniVoiceSession::run_batch(
+    const std::vector<runtime::TaskRequest> & requests) {
+    require_prepared("OmniVoice run_batch()");
+    std::vector<runtime::BatchedTaskResult> results(requests.size());
+    if (requests.empty()) {
+        return results;
+    }
+    // Ohne Stapelbetrieb (Vorgabe), mit mem_saver (der schlanke Graphenpfad
+    // ist nicht gestapelt) oder im Streaming-Modus: einzeln wie bisher.
+    if (max_batch_size_ <= 1 || mem_saver_ || task_.mode != runtime::RunMode::Offline) {
+        for (size_t index = 0; index < requests.size(); ++index) {
+            try {
+                results[index].result = run(requests[index]);
+            } catch (const std::exception & ex) {
+                results[index].error = ex.what();
+            }
+        }
+        return results;
+    }
+
+    const auto wall_start = Clock::now();
+    struct Pending {
+        size_t index = 0;
+        OmniVoiceRequest request;
+        OmniVoicePrompt prompt;
+    };
+    std::vector<Pending> pending;
+    pending.reserve(static_cast<size_t>(max_batch_size_));
+
+    const auto flush = [&]() {
+        if (pending.empty()) {
+            return;
+        }
+        std::vector<OmniVoicePrompt> prompts;
+        std::vector<OmniVoiceGenerationOptions> options;
+        prompts.reserve(pending.size());
+        options.reserve(pending.size());
+        for (const auto & entry : pending) {
+            prompts.push_back(entry.prompt);
+            options.push_back(entry.request.generation);
+        }
+        try {
+            const auto generate_start = Clock::now();
+            auto generated = generator_.generate_batch(prompts, options);
+            engine::debug::timing_log_scalar(
+                "omnivoice.run_batch.generate_ms",
+                engine::debug::elapsed_ms(generate_start, Clock::now()));
+            // Codec und Nachbearbeitung je Stueck: der Codec ist nicht der
+            // Engpass, und die Nachbearbeitung (Tempo, Denoise) liest die
+            // Anfrage des jeweiligen Stuecks.
+            for (size_t slot = 0; slot < pending.size(); ++slot) {
+                try {
+                    const auto decode_start = Clock::now();
+                    auto audio = audio_tokenizer_.decode_audio_tokens(generated[slot]);
+                    const auto decode_end = Clock::now();
+                    const auto result = postprocessor_.finalize(audio, pending[slot].request);
+                    runtime::TaskResult out;
+                    out.audio_output = std::move(result.audio);
+                    results[pending[slot].index].result = std::move(out);
+                    engine::debug::timing_log_scalar(
+                        "omnivoice.run_batch.slot_decode_ms",
+                        engine::debug::elapsed_ms(decode_start, decode_end));
+                } catch (const std::exception & ex) {
+                    results[pending[slot].index].error = ex.what();
+                }
+            }
+        } catch (const std::exception & ex) {
+            for (const auto & entry : pending) {
+                results[entry.index].error = ex.what();
+            }
+        }
+        pending.clear();
+    };
+
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const auto & request = requests[index];
+        try {
+            auto omni_request = make_request(request);
+            // Referenz vorab kodieren wie im Einzelpfad: mit Cache zaehlt das
+            // nur beim ersten Mal, und der Stapel braucht die Tokens als
+            // Prompt-Bestandteil.
+            if (omni_request.reference_audio.has_value()) {
+                const auto reference_tokens = resolve_reference_audio_tokens(
+                    *omni_request.reference_audio,
+                    omni_request.generation.preprocess_prompt,
+                    !omni_request.reference_text.empty());
+                omni_request.reference_rms = reference_tokens.reference_rms;
+                omni_request.reference_audio_tokens = std::move(reference_tokens);
+                omni_request.reference_audio.reset();
+            }
+            const auto prompt = prompt_builder_.build(omni_request);
+            // Nur einstuellige Anfragen in den Stapel: mehrteilige haengen an
+            // ihrer eigenen Chunk-Kette (Kreuzblende, Erst-Chunk als Referenz
+            // der Folgestuecke) und wuerden im Stapel ihre Konditionierung
+            // verlieren - die gehoeren auf den Einzelpfad.
+            const auto chunks = plan_text_chunks(omni_request, prompt);
+            if (chunks.size() != 1) {
+                flush();
+                results[index].result = run(request);
+                continue;
+            }
+            pending.push_back(Pending{index, std::move(omni_request), prompt});
+            if (static_cast<int64_t>(pending.size()) >= max_batch_size_) {
+                flush();
+            }
+        } catch (const std::exception & ex) {
+            results[index].error = ex.what();
+        }
+    }
+    flush();
+    engine::debug::trace_log_scalar("omnivoice.run_batch.requests", static_cast<int64_t>(requests.size()));
+    engine::debug::trace_log_scalar("omnivoice.run_batch.max_batch", max_batch_size_);
+    engine::debug::timing_log_scalar("session.batch_wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
+    return results;
 }
 
 runtime::StreamingPolicy OmniVoiceSession::streaming_policy() const {
